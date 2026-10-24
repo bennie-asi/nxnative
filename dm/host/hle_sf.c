@@ -15,7 +15,7 @@
 
 #define SF_H0 0xd0000u   // session handles: outside the kernel handle table (0x1000 + slot, 4096 slots, hle_thread.c)
 #define SF_MAX 64
-static struct { char name[16]; int used, domain; unsigned seen; } g_sf[SF_MAX];
+static struct { char name[16]; int used, domain, closing; unsigned seen; } g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
 static const char *const sf_served[] = {"olsc:u", "irs", "audren:u"};
 
@@ -27,7 +27,7 @@ static uint32_t sf_new(const char *name, int domain) {
     pthread_mutex_lock(&g_sf_mu);
     unsigned i = 0; while (i < SF_MAX && g_sf[i].used) i++;
     if (i == SF_MAX) die("sf: more than %d host service sessions", SF_MAX);
-    strlcpy(g_sf[i].name, name, sizeof g_sf[i].name); g_sf[i].used = 1; g_sf[i].domain = domain; g_sf[i].seen = 0;
+    strlcpy(g_sf[i].name, name, sizeof g_sf[i].name); g_sf[i].used = 1; g_sf[i].domain = domain; g_sf[i].closing = 0; g_sf[i].seen = 0;
     pthread_mutex_unlock(&g_sf_mu);
     return SF_H0 + i;
 }
@@ -64,7 +64,7 @@ HLE_FORCE("_ZN2nn2sf4hipc6client22ConvertSessionToDomainEPNS0_4cmif18CmifDomainO
 }
 HLE_FORCE("_ZN2nn2sf4hipc6client16DuplicateSessionEPNS_3svc6HandleES4_", "control request: clone a session → a new host session to the same service", Result, h_sf_Dup, uint32_t *out, uint32_t h) {
     int i = sf_slot(h);
-    if (i < 0) { LOG("[RED] sf: DuplicateSession on %#x, not a host session", h); return RES_FAIL; }
+    if (i < 0 || g_sf[i].closing) { LOG("[RED] sf: DuplicateSession on %#x, not an open host session", h); return RES_FAIL; }
     *out = sf_new(g_sf[i].name, g_sf[i].domain); return RES_OK;
 }
 HLE_FORCE("_ZN2nn2sf4hipc6client18DuplicateSessionExEPNS_3svc6HandleES4_j", "control request: clone a session (with a tag) → a new host session to the same service", Result, h_sf_DupEx,
@@ -74,7 +74,8 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
           uint32_t h, uint32_t *m, uint64_t size) {
     int i = sf_slot(h);
     if (i < 0 || size < 8) { LOG("[RED] sf: SendSyncRequest on %#x (%llu bytes), not a host session", h, (unsigned long long)size); return 0xe401u; }   // kernel ResultInvalidHandle
-    if ((m[0] & 0xffff) == 2) { h_sf_Close(h); return RES_OK; }   // HIPC Close: no CMIF payload or response
+    if ((m[0] & 0xffff) == 2) { g_sf[i].closing = 1; return RES_OK; }   // HIPC Close: keep the handle until CloseClientSessionHandle
+    if (g_sf[i].closing) return 0xe401u;
     if (size < 0x40) return 0xe401u;
     uint8_t *base = (uint8_t *)m;
     unsigned type = m[0] & 0xffff, nx = m[0] >> 16 & 15, na = m[0] >> 20 & 15, nb = m[0] >> 24 & 15;

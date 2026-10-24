@@ -67,6 +67,7 @@ int main(void) {
     m[0] = 2; m[1] = 0;
     CHECK(!h_sf_Send(session, m, 8), "HIPC Close needs no CMIF payload");
     CHECK(h_sf_Dup(&handle, session) != 0, "HIPC Close releases its session");
+    h_sf_Close(session);
     CHECK(h_sf_Connect(&session, "unknown") == 0xe15, "unregistered services remain unavailable");
 
     void *backing = NULL; handle = shared_memory_create(0x8000, &backing);
@@ -95,6 +96,9 @@ int main(void) {
     ar1_reply reply;
     CHECK(!ar1_request(1, 1, (const uint8_t *)parameter, sizeof parameter, NULL, 0, NULL, 0, &reply) && reply.value_size == 8 && reply.value >= 0x1000,
           "legacy renderer accepts its original REV1 parameter");
+    parameter[0x30 / 4] = 0x32564552;
+    CHECK(!ar1_request(1, 1, (const uint8_t *)parameter, sizeof parameter, NULL, 0, NULL, 0, &reply),
+          "legacy renderer accepts the SDK 1.6 REV2 parameter");
     parameter[0x30 / 4] = 1;
     CHECK(ar1_request(1, 1, (const uint8_t *)parameter, sizeof parameter, NULL, 0, NULL, 0, &reply) != 0,
           "corrupting the old revision with a modern execution mode is rejected");

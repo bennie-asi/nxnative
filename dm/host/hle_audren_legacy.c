@@ -17,7 +17,7 @@ void ar1_close(void) {
 }
 static uint32_t ar1_word(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static int ar1_param(const uint8_t *p, size_t n) {
-    return p && n >= 0x34 && ar1_word(p + 0x30) == 0x31564552 &&
+    return p && n >= 0x34 && (ar1_word(p + 0x30) == 0x31564552 || ar1_word(p + 0x30) == 0x32564552) &&
         (ar1_word(p) == 48000 || ar1_word(p) == 32000) && ar1_word(p + 4) > 0 && ar1_word(p + 4) <= 1024;
 }
 static void ar1_hex(FILE *f, const void *data, size_t size) {
