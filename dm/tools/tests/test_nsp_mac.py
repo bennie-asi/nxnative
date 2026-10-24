@@ -3,6 +3,7 @@ reused after an iOS build (which builds the Mac's too) and an iOS build is not r
 chain version's c1_full.tsv / cb_extent.tsv name); the run command's environment file is read as the iOS app reads it.
 No game files, keys or Xcode needed (temporary files only in a temporary folder)."""
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -118,6 +119,32 @@ class EnvFile(Base):
 
     def test_missing(self):
         with self.assertRaises(nsp.BuildError): nsp.env_file_pairs(self.tmp / 'none.txt')
+
+
+class NativeProbe(Base):
+    def probe(self, text, rc):
+        def boot(host, patched, env, rd, log, secs):
+            self.assertNotIn('DM_WINDOW', env)
+            self.assertNotIn('DM_AUDIO', env)
+            self.assertEqual(env['DM_LANG'], 'en-US')
+            log.write_text(text)
+            return rc
+        g = types.SimpleNamespace(table=lambda name: self.tmp / name)
+        with mock.patch.object(nsp, 'build_mac_host', return_value=self.tmp / 'dmhost'), mock.patch.object(nsp, 'boot_mac', boot):
+            nsp.probe_mac(REPO, self.tmp, self.tmp / 'extract', self.tmp / 'patched',
+                          {'DM_WINDOW': '1', 'DM_AUDIO': '1'}, self.logs, g, 'en-US')
+
+    def test_running_nnmain_is_reported_without_claiming_graphics_or_device_success(self):
+        self.probe('>>> nnosInitialize\n>>> nnMain\n', None)
+        summary = json.loads((self.logs / 'native_probe.json').read_text())
+        self.assertTrue(summary['nnmain'])
+        self.assertFalse(summary['shader_libraries_loaded'])
+        self.assertFalse(summary['device_tested'])
+
+    def test_crash_and_startup_stall_fail_even_when_a_log_exists(self):
+        for text, rc in (('>>> nnMain\nCRASH sig=11\n', 139), ('>>> nnosInitialize\n', None)):
+            with self.subTest(rc=rc), self.assertRaises(nsp.BuildError): self.probe(text, rc)
+            self.assertTrue((self.logs / 'native_probe.json').is_file())
 
 
 if __name__ == '__main__':

@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import tarfile
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -78,21 +79,36 @@ def download_file(entry, directory, index, opener=urlopen, pause=time.sleep):
     partial = target.with_name(target.name + '.part')
     for attempt in range(1, 4):
         try:
-            request = Request(entry['url'], headers={'User-Agent': 'nxnative-actions'})
-            with opener(request, timeout=60) as response, partial.open('wb') as output:
+            # Resume only with a checksum that verifies the complete input. A server that
+            # ignores Range restarts the file; malformed partial responses never get appended.
+            offset = partial.stat().st_size if entry.get('sha256') and partial.exists() else 0
+            headers = {'User-Agent': 'nxnative-actions', 'Accept-Encoding': 'identity'}
+            if offset: headers['Range'] = f'bytes={offset}-'
+            request = Request(entry['url'], headers=headers)
+            with opener(request, timeout=60) as response:
                 expected = response.headers.get('Content-Length')
                 expected = int(expected) if expected and expected.isdigit() else None
+                status = getattr(response, 'status', 200)
+                if status == 200: offset = 0
+                elif status == 206:
+                    match = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''))
+                    if (not match or int(match[1]) != offset or int(match[2]) != int(match[3]) - 1
+                            or expected is not None and int(match[2]) - offset + 1 != expected):
+                        raise InputError(f'File {index}: invalid HTTP resume response.')
+                    expected = int(match[3]) - offset
+                else: raise InputError(f'File {index}: unexpected HTTP response status {status}.')
                 if expected is not None and expected + GIB > shutil.disk_usage(directory).free:
                     raise InputError(f'File {index}: insufficient disk space for this download.')
-                written, last_report = 0, time.monotonic()
-                while chunk := response.read(8 * 2**20):
-                    output.write(chunk)
-                    written += len(chunk)
-                    if time.monotonic() - last_report >= 30:
-                        print(f'File {index}: downloaded {written / GIB:.2f} GiB', flush=True)
-                        last_report = time.monotonic()
-                if expected is not None and written != expected:
-                    raise OSError('Incomplete download')
+                written, last_report = offset, time.monotonic()
+                with partial.open('ab' if offset else 'wb') as output:
+                    while chunk := response.read(8 * 2**20):
+                        output.write(chunk)
+                        written += len(chunk)
+                        if time.monotonic() - last_report >= 30:
+                            print(f'File {index}: downloaded {written / GIB:.2f} GiB', flush=True)
+                            last_report = time.monotonic()
+                    if expected is not None and written != expected + offset:
+                        raise OSError('Incomplete download')
             partial.replace(target)
             verify_file(target, entry.get('sha256'))
             print(f'File {index}: ready ({target.stat().st_size / GIB:.2f} GiB)', flush=True)
@@ -102,10 +118,10 @@ def download_file(entry, directory, index, opener=urlopen, pause=time.sleep):
             target.unlink(missing_ok=True)
             raise
         except (OSError, URLError, HTTPException) as error:
-            partial.unlink(missing_ok=True)
             # Exception messages can contain signed URLs. Report only the HTTP status or error type.
             reason = f'HTTP {error.code}' if isinstance(error, HTTPError) else type(error).__name__
             if attempt == 3:
+                partial.unlink(missing_ok=True)
                 raise InputError(f'File {index}: download failed ({reason}); check URL access and expiry.') from None
             print(f'File {index}: retrying download ({reason}, attempt {attempt}/3)', flush=True)
             pause(attempt * 2)
@@ -140,10 +156,22 @@ def check_encryption_space(directory):
                          f'{required / GIB:.1f} GiB needed for another copy and a 1 GiB margin.')
 
 
+def collect_diagnostics(directory, output):
+    """Archive only allowlisted textual diagnostics; game binaries and keys are excluded."""
+    patterns = ('*_build/logs/*.log', '*_build/logs/*.json', '*_survey/logs/*.log',
+                '*_survey/survey.md', '*_build/profile/*/game.tsv')
+    files = sorted({p for pattern in patterns for p in directory.glob(pattern)
+                    if p.is_file() and not p.is_symlink()})
+    with tarfile.open(output, 'w:gz') as archive:
+        for path in files: archive.add(path, arcname=path.relative_to(directory), recursive=False)
+    print(f'Collected {len(files)} diagnostic file(s); archive must be encrypted before upload.')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('validate', 'download', 'check-encryption-space'))
+    parser.add_argument('command', choices=('validate', 'download', 'check-encryption-space', 'diagnostics'))
     parser.add_argument('--game-dir', type=Path)
+    parser.add_argument('--output', type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == 'validate':
@@ -155,6 +183,9 @@ def main(argv=None):
             if args.command == 'download':
                 files = load_inputs(os.environ)
                 prepare_game(args.game_dir, files, os.environ['PROD_KEYS'])
+            elif args.command == 'diagnostics':
+                if args.output is None: raise InputError('--output is required for diagnostics.')
+                collect_diagnostics(args.game_dir, args.output)
             else:
                 check_encryption_space(args.game_dir)
     except (InputError, OSError) as error:

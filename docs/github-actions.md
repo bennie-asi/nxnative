@@ -33,7 +33,7 @@ For the base game alone, use an array with just its object. Add DLC as more obje
 Get-FileHash -Algorithm SHA256 -LiteralPath 'D:\Games\Base [010015100B514000][v0].nsp'
 ```
 
-Give signed URLs enough lifetime for the queue, dependency installation and downloads. For example, a full day avoids short expiry windows. A new run needs URLs that are still valid. The download step retries interrupted downloads from the beginning and checks the file header, length when supplied by the server, and optional checksum.
+Give signed URLs enough lifetime for the queue, dependency installation and downloads. For example, a full day avoids short expiry windows. A new run needs URLs that are still valid. The download step retries interrupted downloads and checks the file header, length when supplied by the server, and optional checksum. When a checksum is supplied and the server supports byte ranges, retries resume the partial download; otherwise they restart it. A server that ignores Range is handled by restarting the file.
 
 ## 2. Provide keys and the download password
 
@@ -62,8 +62,11 @@ The uploaded file is always encrypted with GnuPG AES-256 and integrity protectio
 | `package` | Optional NSP version tag, such as `v327680` or `v0`. Empty selects the newest supplied version. |
 | `free_disk_space` | Enabled by default. Removes unused Xcode installations on this temporary GitHub-hosted VM, preserving the selected Xcode. |
 | `check_only` | Checks dependency installation, ARM64 architecture, the iOS/macOS Metal compilers and data-free regression tests, without secrets, game downloads or an IPA. Useful for checking the runner first. |
+| `native_probe` | Experimental bring-up: extracts and rewrites the game, then boots it headlessly for up to 60 seconds before compiling shaders. A crash or failure to reach `nnMain` stops the build and saves diagnostics. Reaching `nnMain` does not establish working graphics or iPhone compatibility. |
 
 The normal build validates the secrets, installs dependencies, downloads the game, checks disk space, runs `scripts/build_ipa_from_nsp.py`, encrypts the IPA, and uploads it. Build progress and failure details appear in the job's steps. The job has a 350-minute timeout, leaving some room within GitHub's hosted-job limit.
+
+Build logs, survey text and provisional profile settings are also saved in a separate encrypted `nxnative-diagnostics-<run ID>-<attempt>` artifact, including after a failed build when available. Decrypt `diagnostics.tar.gz.gpg` with the same `IPA_PASSWORD` and unpack it to inspect the complete logs. Game binaries and keys are excluded. Locally, `--mac-probe` runs the same bounded startup check without compiling shaders or producing an IPA.
 
 ## 4. Download and decrypt on Windows
 

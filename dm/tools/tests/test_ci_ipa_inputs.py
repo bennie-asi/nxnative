@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import tarfile
 import types
 import unittest
 from unittest import mock
@@ -30,9 +31,11 @@ def environment(files=None):
 
 
 class Response(io.BytesIO):
-    def __init__(self, data, length=None):
+    def __init__(self, data, length=None, status=200, content_range=None):
         super().__init__(data)
         self.headers = {'Content-Length': str(len(data) if length is None else length)}
+        self.status = status
+        if content_range: self.headers['Content-Range'] = content_range
 
 
 class Inputs(unittest.TestCase):
@@ -98,6 +101,30 @@ class Files(unittest.TestCase):
         self.assertEqual((self.directory / ENTRY['name']).read_bytes(), NSP)
         pause.assert_called_once()
 
+    def test_checksum_download_resumes_an_interruption(self):
+        entry = {**ENTRY, 'sha256': hashlib.sha256(NSP).hexdigest()}
+        opener = mock.Mock(side_effect=[Response(NSP[:8], len(NSP)),
+            Response(NSP[8:], status=206, content_range=f'bytes 8-{len(NSP)-1}/{len(NSP)}')])
+        with contextlib.redirect_stdout(io.StringIO()):
+            ci.download_file(entry, self.directory, 1, opener=opener, pause=mock.Mock())
+        self.assertEqual(opener.call_args.args[0].get_header('Range'), 'bytes=8-')
+        self.assertEqual((self.directory / ENTRY['name']).read_bytes(), NSP)
+
+    def test_ignored_range_restarts_instead_of_appending(self):
+        entry = {**ENTRY, 'sha256': hashlib.sha256(NSP).hexdigest()}
+        opener = mock.Mock(side_effect=[Response(NSP[:8], len(NSP)), Response(NSP)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            ci.download_file(entry, self.directory, 1, opener=opener, pause=mock.Mock())
+        self.assertEqual((self.directory / ENTRY['name']).read_bytes(), NSP)
+
+    def test_wrong_resume_range_is_rejected(self):
+        entry = {**ENTRY, 'sha256': hashlib.sha256(NSP).hexdigest()}
+        opener = mock.Mock(side_effect=[Response(NSP[:8], len(NSP)),
+            Response(NSP[8:], status=206, content_range=f'bytes 0-{len(NSP)-9}/{len(NSP)-8}')])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ci.InputError, 'resume'):
+            ci.download_file(entry, self.directory, 1, opener=opener, pause=mock.Mock())
+        self.assertFalse(list(self.directory.iterdir()))
+
     def test_network_errors_do_not_disclose_url(self):
         for error in (HTTPError(ENTRY['url'], 403, 'private-token', {}, None),
                       URLError(ENTRY['url']), IncompleteRead(b'partial')):
@@ -140,6 +167,21 @@ class Files(unittest.TestCase):
         with mock.patch.object(ci.shutil, 'disk_usage', return_value=types.SimpleNamespace(free=ci.GIB)):
             with self.assertRaisesRegex(ci.InputError, 'encrypted IPA'):
                 ci.check_encryption_space(self.directory)
+
+    def test_diagnostics_include_logs_but_exclude_keys_and_game_data(self):
+        for name in ('0100643002136000_build/logs/native_probe.log',
+                     '0100643002136000_build/logs/native_probe.json',
+                     '0100643002136000_build/profile/0100643002136000/game.tsv',
+                     '0100643002136000_survey/survey.md',
+                     'prod.keys', 'base.xci', '0100643002136000_build/extract/RomFS/root.arc'):
+            path = self.directory / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(name)
+        output = self.directory / 'diagnostics.tar.gz'
+        with contextlib.redirect_stdout(io.StringIO()): ci.collect_diagnostics(self.directory, output)
+        with tarfile.open(output) as archive:
+            names = archive.getnames()
+        self.assertEqual(len(names), 4)
+        self.assertTrue(any(name.endswith('native_probe.log') for name in names))
+        self.assertFalse(any(name.endswith(('.keys', '.xci', '.arc')) for name in names))
 
 
 class Cli(unittest.TestCase):

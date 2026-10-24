@@ -941,6 +941,34 @@ def host_stopped(log, rc, secs):   # a capture run whose host stopped by itself 
              + ''.join(collections.deque(open(log, errors='replace'), maxlen=12)).rstrip('\n'))
 
 
+def probe_mac(repo, work, game, patched, env, logs, g, lang, aoc=None):
+    """A bounded native startup probe before shader compilation. No shader libraries are
+    loaded, so reaching nnMain only establishes startup progress, not rendered frames."""
+    PROG.stage('native startup probe', step='building the Mac host')
+    host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
+    rd, log = work / 'run/probe', logs / 'native_probe.log'
+    for name in ('save', 'temp', 'msl'): (rd / name).mkdir(parents=True, exist_ok=True)
+    henv = dict(env, DM_ROMFS=str(game / 'RomFS'), DM_SAVE=str(rd / 'save'),
+                DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'),
+                DM_NVN_SHMAP=str(g.table('shader_map.tsv')), DM_LANG=lang,
+                DM_FS='1', DM_SVC='1', DM_WATCH='30')
+    for name in ('DM_WINDOW', 'DM_AUDIO'): henv.pop(name, None)
+    if aoc: henv['DM_AOC_DIR'] = str(aoc)
+    PROG.set(step='booting the rewritten game for up to 60 seconds')
+    started = time.monotonic()
+    rc = boot_mac(host, patched, henv, rd, log, 60)
+    text = log.read_text(errors='replace')
+    summary = {'nnmain': '>>> nnMain' in text, 'exit_code': rc,
+               'elapsed_seconds': round(time.monotonic() - started, 2),
+               'shader_libraries_loaded': False, 'device_tested': False}
+    (logs / 'native_probe.json').write_text(json.dumps(summary, indent=2) + '\n')
+    PROG.end(json.dumps(summary))
+    if not summary['nnmain'] or rc is not None:
+        PROG.say('---- last lines of the native startup probe ----\n' + '\n'.join(text.splitlines()[-45:]))
+        raise BuildError(f'native startup probe did not stay running in nnMain (exit {rc}); see {log}')
+    say('Native startup reached nnMain. Shaders were not loaded; rendering and iPhone behavior are untested.')
+
+
 def capture_glslc(repo, dirs, pkg_ver, patched, work, env, logs, g):
     """A game that compiles some shaders at run time with its own GLSLC (Fire Emblem: Three Houses; profile_guess.py shader_sources), so no game file holds them. The game boots in the Mac host
     (headless and silent) with DM_GLSLC_CAPTURE (dm/host/hle_glslc.c), which writes each output to <version dir>/glslc_capture, where shader_split.py reads them; the outputs are the same on every run.
@@ -1503,6 +1531,7 @@ def parse_args(argv):
     ap.add_argument('--env-file', help='environment switches for a diagnostic build (one KEY=VALUE per line)')
     ap.add_argument('--show-fps', action=argparse.BooleanOptionalAction, help='show the game\'s frame rate on the iPhone, frames on screen per second at the top left (default: the SHOW_FPS setting, on)')
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
+    ap.add_argument('--mac-probe', action='store_true', help='extract, rewrite and probe native startup for 60 seconds on an ARM64 Mac; no shader compilation or IPA, diagnostics in the build logs')
     ap.add_argument('--allow-damaged', action='store_true', help='a damaged NSP (files failing the NCA hash check): write them as read and go on instead of stopping')
     ap.add_argument('--profile-out', help='where the provisional profile goes (default: <NSP folder>/<title ID>_build/profile)')
     ap.add_argument('--provisional', action='store_true', help='build from a provisional profile even when dm/games has one for the game (tests the guesses)')
@@ -1536,7 +1565,7 @@ def main(args=None):
     prepare_xcode = args.prepare_xcode or PREPARE_XCODE
     platform = args.platform or PLATFORM
     if platform not in ('ios', 'mac'): raise BuildError(f'PLATFORM / --platform must be ios or mac: {platform}')
-    mac = platform == 'mac'   # a Mac-only build for development: no iOS shaders, Xcode project or IPA (mac_run)
+    mac = platform == 'mac' or args.mac_probe   # a Mac-only build or bounded startup probe: no IPA
     if mac and prepare_xcode: raise BuildError('--prepare-xcode makes an iPhone project: it cannot be combined with --platform mac')
     if mac and not apple_silicon(): raise BuildError('--platform mac runs the game in the Mac host, which runs the game\'s own arm64 code natively: it needs a Mac with Apple silicon, and this Mac has an Intel processor')
     keep = KEEP_EXTRACTED if args.keep_extracted is None else args.keep_extracted
@@ -1689,6 +1718,9 @@ def main(args=None):
         if provisional and heapck and pg.heap_check_needed(game / 'ExeFS'):
             if apple_silicon(): PROG.add(1); g = heap_check(repo, game, patched, work, env, logs, g)
             else: say('no heap check: it boots the game in the Mac host, which needs a Mac with Apple silicon; the profile keeps its guessed heap keys')
+    if args.mac_probe:
+        probe_mac(repo, work, game, patched, env, logs, g, lang, aoc)
+        return
     if glslc: capture_glslc(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     if uedec: decode_ue_shaders(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     sh = work / 'shader'
