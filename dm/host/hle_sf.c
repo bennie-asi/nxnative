@@ -1,8 +1,9 @@
 // Services whose client a game links into its own main (nn::sf::hipc): Animal Crossing: New Horizons 3.0.3 carries the clients of olsc:u (cloud save data backup settings,
 // main+0x404bc6c) and npns (push notifications). The SDK's client code connects through sm (an abort in sm::Initialize under InitializeHipcServiceResolution, from main+0x5b8198) and talks
 // HIPC through svcSendSyncRequest; the host has neither. It hands out sessions of its own instead and answers each request in the message buffer, for the services listed in sf_served:
-// success, the output data zeroed, no objects or handles. For olsc that reads as "backup off for every user", so the game leaves the settings alone (main+0x2809c8c asks per user and
+// olsc returns success with zeroed data and no objects or handles. That reads as "backup off for every user", so the game leaves the settings alone (main+0x2809c8c asks per user and
 // switches backup off where it is on). Any other service name is refused with a red line, as sm refuses a service that is not registered.
+// irs is also registered: it exposes shared status for nine disconnected IR cameras, and returns the no-camera result for processing requests.
 // The SDK's own client functions are taken over where they reach the kernel (their calls inside sdk go through its PLT): the session manager's CreateNewSession runs natively on
 // DuplicateSession, and ConvertToDomainImpl on QueryPointerBufferSize and ConvertSessionToDomain. DM_SF_TRACE=1 dumps every request.
 // Message layout (Atmosphère / libnx): HIPC header {u16 type, counts of X / A / B / W descriptors; u32 data words, receive list, special header flag}, the special header and descriptors,
@@ -15,7 +16,7 @@
 #define SF_MAX 64
 static struct { char name[16]; int used, domain; unsigned seen; } g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
-static const char *const sf_served[] = {"olsc:u"};
+static const char *const sf_served[] = {"olsc:u", "irs"};
 
 static int sf_slot(uint32_t h) {
     unsigned i = h - SF_H0;
@@ -35,7 +36,7 @@ HLE_FORCE("_ZN2nn2sf4hipc29FinalizeHipcServiceResolutionEv", "service name resol
 HLE_FORCE("_ZN2nn2sf4hipc20ConnectToHipcServiceEPNS_3svc6HandleEPKc", "connect to a service through sm → a host session for the services the host serves", Result, h_sf_Connect,
           uint32_t *out, const char *name) {
     for (size_t k = 0; k < sizeof sf_served / sizeof *sf_served; k++)
-        if (!strncmp(name, sf_served[k], 8)) { *out = sf_new(sf_served[k], 0); LOG("sf: %s → host session %#x (every request succeeds with zeroed output)", sf_served[k], *out); return RES_OK; }
+        if (!strncmp(name, sf_served[k], 8)) { *out = sf_new(sf_served[k], 0); LOG("sf: %s → host session %#x", sf_served[k], *out); return RES_OK; }
     LOG("[RED] sf: the game connects to service %.8s itself, which the host does not serve", name);
     return 0xe15u;   // sm ResultNotRegistered
 }
@@ -86,12 +87,34 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     if (magic != 0x49434653) { LOG("[RED] sf: %s: request without SFCI (%#x)", g_sf[i].name, magic); return 0xe401u; }
     unsigned key = (obj & 0xff) << 16 | (cmd & 0xffff);   // log each object / command once
     pthread_mutex_lock(&g_sf_mu); int first = g_sf[i].seen != key; g_sf[i].seen = key; pthread_mutex_unlock(&g_sf_mu);
-    if (first || trace) LOG("sf: %s object %u command %u (%u data words in): success, zeroed output", g_sf[i].name, obj, cmd, ndw);
+    // SDK 1.6 embeds its IRS client in main, outside the SDK takeovers. Revelations
+    // main+0xacd240 dereferences a null service after ConnectToHipcService("irs")
+    // is refused. Model the registered service with nine disconnected IR cameras.
+    // Layout and command IDs: libnx nx/source/services/irs.c and services/irs.h.
+    uint32_t result = RES_OK, copy_handle = 0, camera = 0;
+    int irs = !strcmp(g_sf[i].name, "irs");
+    if (irs) {
+        if (cmd == 304) {   // GetIrsensorSharedMemoryHandle: a copied handle to 0x8000 bytes
+            void *status = NULL;
+            copy_handle = shared_memory_create(0x8000, &status);
+            if (!copy_handle) result = RES_FAIL;
+            else for (unsigned k = 0; k < 9; k++) *(uint32_t *)((uint8_t *)status + k * 0xe30) = 2;   // IrCameraStatus::Unconnected
+        } else if (cmd == 311) {   // GetIrCameraHandle(NpadId): handheld uses slot 8
+            if (hin + 20 > size) return 0xe401u;
+            uint32_t id = *(uint32_t *)(base + hin + 16);
+            camera = id == 0x20 ? 8 : id;
+            if (camera > 8) result = 0xdccd;   // IRS: no connected camera
+        } else if (cmd != 302 && cmd != 303 && cmd != 305 && cmd != 318) result = 0xdccd;
+    }
+    if (first || trace) LOG("sf: %s object %u command %u (%u data words in): result %#x", g_sf[i].name, obj, cmd, ndw, result);
     // The response: no special header and no descriptors, so the data words start at +8 and the CMIF part at +0x10; everything after the headers up to the buffer's end reads as zero
     size_t end = size < 0x1000 ? size : 0x1000;
     memset(base, 0, end);
-    m[1] = (uint32_t)((end - 8) / 4 < 0x3ff ? (end - 8) / 4 : 0x3ff);
+    size_t head = copy_handle ? 16 : 8;
+    m[1] = (uint32_t)((end - head) / 4 < 0x3ff ? (end - head) / 4 : 0x3ff);
+    if (copy_handle) { m[1] |= 1u << 31; m[2] = 2; m[3] = copy_handle; }
     size_t out = 0x10 + (dom ? 16 : 0);
-    uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = RES_OK; o[3] = 0;   // "SFCO"; a domain's out-object count before it stays 0
+    uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = result; o[3] = 0;   // "SFCO"; a domain's out-object count before it stays 0
+    if (irs && cmd == 311 && out + 20 <= end) o[4] = camera;
     return RES_OK;
 }

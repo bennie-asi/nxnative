@@ -67,6 +67,11 @@ int dm_sdk_major(void);   // SDK major version from the sdk module's version str
 #define DM_SDK_OLD(major) ((major) > 0 && (major) <= 10)   // SDK 10 and older: NVN API 53, the shared-font address points at the TTF itself
 int dm_main_imports(const char *prefix);   // main imports a symbol whose name starts with prefix (loader.c)
 void *guest_sym(const char *name);
+// Host service shared memory: kernel handles, coherent guest mappings and QueryMemory boundaries.
+uint32_t shared_memory_create(size_t size, void **backing);
+int shared_memory_svc(int num, uint64_t *regs);
+int shared_memory_query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *perm);
+void shared_memory_free_bounds(uint64_t addr, uint64_t *lo, uint64_t *hi);
 module_t *module_of(const void *p);
 // Gate dispatch: rewritten svc / timer reads come in through the common entry, ret_addr = the return point of that gate block, regs points to the saved x0..x30
 uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs);

@@ -132,6 +132,7 @@ int svc_thread(int num, uint64_t *regs);   // hle_thread.c: thread and synchroni
 uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     { void hlecount_svc(int); hlecount_svc(num); }   // DM_HLECOUNT: svc counts by number
     mem_init();
+    if (shared_memory_svc(num, regs)) return regs[0];
     if (svc_thread(num, regs)) return regs[0];
     switch (num) {
     case 0x01: {  // SetHeapSize(out_addr*, size)  → x1 = heap base
@@ -184,10 +185,11 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // MemoryInfo: base(0) size(8) state(0x10) attr(0x14) perm(0x18) ...
         uint8_t *a = (uint8_t *)addr;
         uint64_t base, size, state, perm;
-        int k;
+        int k; uint32_t shared_perm;
         pthread_mutex_lock(&g_map_lock);   // the registry branches read g_map; the other branches are cheap, so the lock simply spans the whole chain
         if (a >= g_heap && a < g_heap + g_heap_cur) { base=(uint64_t)g_heap; size=g_heap_cur; state=5/*Heap*/; perm=3; }
         else if ((k = map_find(addr, 1))) { base=g_map[k-1].base; size=g_map[k-1].size; state=g_map[k-1].state; perm=3; }
+        else if (shared_memory_query(addr, &base, &size, &shared_perm)) { state=6/*SharedMemory*/; perm=shared_perm; }
         else if (a >= g_as && a < g_as + RESERVE) {   // free: up to the adjacent mapping/heap boundary
             uint64_t lo = (uint64_t)g_as, hi = (uint64_t)g_as + RESERVE;
             if (a >= g_heap) lo = (uint64_t)g_heap + g_heap_cur;
@@ -197,6 +199,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
                 if (e <= addr && e > lo) lo = e;
                 if (g_map[i].base > addr && g_map[i].base < hi) hi = g_map[i].base;
             }
+            shared_memory_free_bounds(addr, &lo, &hi);
             base=lo; size=hi-lo; state=0; perm=0; }
         else if (module_of(a)) {
             // Loaded module: report the regions in Horizon's layout -- code [0, ro) Code+RX, read-only [ro, data) Code+R, data and bss [data, patch area) CodeData+RW.

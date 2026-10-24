@@ -54,6 +54,8 @@ jobs:
           with tarfile.open(root / 'bundle.tar.gz') as archive:
               archive.extractall(root, filter='data')
           PY
+      - name: Check service and shared-memory behavior
+        run: make -C dm/host/tests GAME=010015100B514000 sf
       - name: Probe prepared modules
         continue-on-error: true
         env:
