@@ -1,0 +1,183 @@
+name: Build iPhone IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS ARM64 runner (xlarge is paid and does not guarantee more disk)
+        type: choice
+        options:
+          - macos-26
+          - macos-26-xlarge
+        default: macos-26
+      language:
+        description: Game language (leave empty for the build script's default)
+        type: string
+        default: ""
+      app_name:
+        description: Home-screen name (leave empty for the game's name)
+        type: string
+        default: ""
+      package:
+        description: Update version, e.g. v327680 (leave empty for the newest supplied)
+        type: string
+        default: ""
+      free_disk_space:
+        description: Remove unused Xcode versions on this temporary GitHub runner
+        type: boolean
+        default: true
+      check_only:
+        description: Check the toolchain without downloading a game or requiring secrets
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Prepare temporary paths
+        run: |
+          printf 'NX_GAME_DIR=%s\nNX_OUTPUT_DIR=%s\nGNUPGHOME=%s\n' \
+            "$RUNNER_TEMP/nxnative-game" "$RUNNER_TEMP/nxnative-output" \
+            "$RUNNER_TEMP/nxnative-gnupg" >> "$GITHUB_ENV"
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Validate build secrets
+        if: ${{ !inputs.check_only }}
+        env:
+          GAME_FILES_JSON: ${{ secrets.GAME_FILES_JSON }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: python dm/tools/ci_ipa_inputs.py validate
+
+      - name: Free disk space
+        if: ${{ inputs.free_disk_space }}
+        run: |
+          # Only change the disposable GitHub VM, preserving its selected Xcode.
+          if [[ "$RUNNER_ENVIRONMENT" != github-hosted ]]; then
+            exit 0
+          fi
+          active_developer_dir="${DEVELOPER_DIR:-$(xcode-select -p)}"
+          active_xcode="$(cd "$active_developer_dir/../.." && pwd -P)"
+          for candidate in /Applications/Xcode_*.app; do
+            [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+            if [[ "$(cd "$candidate" && pwd -P)" != "$active_xcode" ]]; then
+              echo "Removing unused Xcode: $candidate"
+              sudo rm -rf -- "$candidate"
+            fi
+          done
+          df -h "$RUNNER_TEMP"
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install dependencies and check Metal
+        run: |
+          [[ "$(uname -m)" == arm64 ]] || { echo 'An ARM64 Mac runner is required.'; exit 1; }
+          brew install xcodegen zstd spirv-cross glslang gnupg
+          python -m pip install lz4 capstone fonttools 'backports.zstd; python_version < "3.14"'
+          xcodebuild -version
+          if ! xcrun --sdk iphoneos metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun --sdk iphoneos metal --version
+          xcrun --sdk macosx metal --version
+          dotnet --version
+          df -h "$RUNNER_TEMP"
+
+      - name: Download game files and write keys
+        if: ${{ !inputs.check_only }}
+        env:
+          GAME_FILES_JSON: ${{ secrets.GAME_FILES_JSON }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: python dm/tools/ci_ipa_inputs.py download --game-dir "$NX_GAME_DIR"
+
+      - name: Build unsigned IPA
+        if: ${{ !inputs.check_only }}
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          GAME_LANGUAGE: ${{ inputs.language }}
+          GAME_PACKAGE: ${{ inputs.package }}
+        run: |
+          args=("$NX_GAME_DIR" -k "$NX_GAME_DIR/prod.keys"
+                -o "$NX_GAME_DIR/game.ipa" --no-keep-extracted --progress lines)
+          [[ -z "$APP_NAME" ]] || args+=(--app-name "$APP_NAME")
+          [[ -z "$GAME_LANGUAGE" ]] || args+=(--language "$GAME_LANGUAGE")
+          [[ -z "$GAME_PACKAGE" ]] || args+=(--package "$GAME_PACKAGE")
+          python scripts/build_ipa_from_nsp.py "${args[@]}"
+
+      - name: Encrypt IPA for download
+        if: ${{ !inputs.check_only }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          python dm/tools/ci_ipa_inputs.py check-encryption-space --game-dir "$NX_GAME_DIR"
+          mkdir -p "$NX_OUTPUT_DIR" "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_OUTPUT_DIR/game.ipa.gpg" "$NX_GAME_DIR/game.ipa" <<< "$IPA_PASSWORD"
+          rm -f -- "$NX_GAME_DIR/game.ipa"
+          (cd "$NX_OUTPUT_DIR" && shasum -a 256 game.ipa.gpg > SHA256SUMS.txt)
+
+      - name: Upload encrypted IPA
+        id: upload
+        if: ${{ !inputs.check_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.NX_OUTPUT_DIR }}/game.ipa.gpg
+            ${{ env.NX_OUTPUT_DIR }}/SHA256SUMS.txt
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Write download instructions
+        if: ${{ !inputs.check_only }}
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            echo '## Unsigned IPA ready'
+            echo "Download: $ARTIFACT_URL"
+            echo
+            echo 'Extract the artifact ZIP, then decrypt with the IPA_PASSWORD you saved:'
+            echo '```sh'
+            echo 'gpg --output game.ipa --decrypt game.ipa.gpg'
+            echo '```'
+            echo 'The artifact expires after 3 days. Sign and sideload game.ipa on your own device.'
+            echo 'See docs/github-actions.md for the complete instructions.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove keys and plaintext IPA
+        if: ${{ always() }}
+        run: |
+          if [[ -n "${NX_GAME_DIR:-}" ]]; then
+            rm -f -- "$NX_GAME_DIR/prod.keys" "$NX_GAME_DIR/game.ipa"
+          fi

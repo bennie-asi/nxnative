@@ -86,6 +86,8 @@ The IPA appears in the same folder (here `~/Games/MarioWonder/SMBWMobile.ipa`). 
 
 With an Apple developer account you can instead build and install from Xcode: `--prepare-xcode` makes an Xcode project for the game rather than an IPA ([Build and run on a device with Xcode](docs/development.md#build-and-run-on-a-device-with-xcode)).
 
+Without a local Mac, use the manual [GitHub Actions workflow](docs/github-actions.md) to build on an ARM64 macOS runner. The guide covers private game download URLs, `prod.keys`, downloading and decrypting the IPA on Windows, and the runner's disk-space limits.
+
 ## Play
 
 **Settings.** A screen before the game starts offers what the game supports: frame rate, render scale, docked or handheld mode, game language, the frame-rate counter and Apple's performance HUD. Tap **Play** to start; the app remembers your choices.
