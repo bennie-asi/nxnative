@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--root', required=True, type=Path)
     parser.add_argument('--title', required=True)
     parser.add_argument('--package', default='v0')
+    parser.add_argument('--capture-audio', action='store_true', help='Capture the first legacy audio update and stop before playback')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9A-Fa-f]{16}', args.title) or not re.fullmatch(r'v\d+', args.package):
         parser.error('title must be a 16-digit title ID and package must be v<version>')
@@ -32,7 +33,7 @@ def main():
     g = game.load()
     logs = work / 'logs'; logs.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, DM_ROOT=str(work), WORK=str(work / 'tmp'))
-    env['DM_AUDREN_LEGACY_CAPTURE'] = str(logs / 'audren_legacy_capture.json')
+    if args.capture_audio: env['DM_AUDREN_LEGACY_CAPTURE'] = str(logs / 'audren_legacy_capture.json')
     (work / 'tmp').mkdir(exist_ok=True)
     nsp.PROG.mode = 'lines'
     print('Prepared-module startup probe: RomFS assets may be absent; asset failures do not establish game compatibility.', flush=True)

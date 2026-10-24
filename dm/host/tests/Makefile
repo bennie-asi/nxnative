@@ -30,11 +30,17 @@ run: $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_commit_list $(B)/
 	$(B)/t_sf
 run: $(B)/t_nro
 run: $(B)/t_sf
-$(B)/t_sf: t_sf.c ../hle_sf.c ../hle_shmem.c ../hle_audren_legacy.c ../audren_legacy.h ../hle.h ../dm.h $(GAME_H) | $(B)
-	clang -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_sf.c ../hle_shmem.c ../hle_audren_legacy.c
+$(B)/t_sf: t_sf.c ../hle_sf.c ../hle_shmem.c ../hle_audren_legacy.c ../hle_audren_dsp.c ../audren_legacy.h ../legacy_audio_dsp.h ../legacy_audio_protocol.h ../hle.h ../dm.h $(GAME_H) | $(B)
+	clang -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_sf.c ../hle_shmem.c ../hle_audren_legacy.c ../hle_audren_dsp.c
 .PHONY: sf
 sf: $(B)/t_sf
 	$(B)/t_sf
+.PHONY: dsp
+$(B)/t_audren_dsp: t_audren_dsp.c ../hle_audren_dsp.c ../legacy_audio_dsp.h ../legacy_audio_protocol.h | $(B)
+	clang -O1 -g -Wall -Werror -I.. -o $@ t_audren_dsp.c ../hle_audren_dsp.c
+dsp: $(B)/t_audren_dsp
+	$(B)/t_audren_dsp
+run: dsp
 $(B)/t_nro: t_nro.c ../loader.c ../hle_ro.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	clang -O1 -g -Wall -Wno-unused-function -Wno-deprecated-declarations -I.. $(GINC) -o $@ t_nro.c
 .PHONY: nro

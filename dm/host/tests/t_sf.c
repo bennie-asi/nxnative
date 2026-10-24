@@ -1,5 +1,7 @@
 // Real HIPC replies and Mach shared-memory mappings, with no game files or GPU.
 #include <sys/mman.h>
+#include <stdatomic.h>
+#include <time.h>
 #include "../hle_sf.c"
 
 static uint8_t *guest;
@@ -7,8 +9,25 @@ static const size_t guest_size = 0x18000;
 int dm_guest_as_contains(uintptr_t a) { return a >= (uintptr_t)guest && a - (uintptr_t)guest < guest_size; }
 static int checks, failures;
 #define CHECK(c, msg) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)
-int svc_thread(int num, uint64_t *regs) { (void)num; (void)regs; CHECK(0, "audio event kernel calls are outside this fixture"); return 0; }
-uint32_t hle_copy_event_handle(uint32_t handle) { (void)handle; CHECK(0, "audio event copies are outside this fixture"); return 0; }
+static _Atomic int audio_live, audio_closed, event_live, event_signals, audio_appends;
+int svc_thread(int num, uint64_t *regs) {
+    if (num == 0x45) { regs[0] = 0; regs[1] = 0x7000; regs[2] = 0x7001; atomic_fetch_add(&event_live, 2); }
+    else if (num == 0x11) { regs[0] = 0; atomic_fetch_add(&event_signals, 1); }
+    else if (num == 0x16) { regs[0] = 0; atomic_fetch_sub(&event_live, 1); }
+    else { regs[0] = 0xe401; }
+    return 1;
+}
+uint32_t hle_copy_event_handle(uint32_t handle) { atomic_fetch_add(&event_live, 1); return handle + 1; }
+typedef struct { void *queue[4]; unsigned head, tail; } fake_pcm;
+void *dm_pcmout_open(int ch) { (void)ch; atomic_fetch_add(&audio_live, 1); return calloc(1, sizeof(fake_pcm)); }
+void dm_pcmout_start(void *k) { (void)k; }
+int dm_pcmout_append(void *k, void *b) { fake_pcm *p = k; p->queue[p->tail++ % 4] = b; atomic_fetch_add(&audio_appends, 1); return 1; }
+void *dm_pcmout_released(void *k) {
+    struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
+    fake_pcm *p = k; return p->head != p->tail ? p->queue[p->head++ % 4] : NULL;
+}
+void dm_pcmout_wait(void *k, int ms) { (void)k; struct timespec pause = {0, ms * 1000000L}; nanosleep(&pause, NULL); }
+void dm_pcmout_close(void *k) { free(k); atomic_fetch_sub(&audio_live, 1); atomic_fetch_add(&audio_closed, 1); }
 
 static Result request(uint32_t handle, unsigned command, uint32_t arg, int domain, uint32_t *m) {
     memset(m, 0, 0x100);
@@ -102,6 +121,23 @@ int main(void) {
     parameter[0x30 / 4] = 1;
     CHECK(ar1_request(1, 1, (const uint8_t *)parameter, sizeof parameter, NULL, 0, NULL, 0, &reply) != 0,
           "corrupting the old revision with a modern execution mode is rejected");
+    parameter[0x30 / 4] = 0x32564552; parameter[2] = 2; parameter[4] = 1; parameter[5] = 1;
+    CHECK(!ar1_request(1, 0, (const uint8_t *)parameter, sizeof parameter, NULL, 0, NULL, 0, &reply) && reply.new_session,
+          "legacy renderer opens the real software backend");
+    CHECK(!ar1_request(0, 7, NULL, 0, NULL, 0, NULL, 0, &reply) && reply.copy_handle && atomic_load(&event_live) == 3,
+          "renderer event reply owns a copied read handle");
+    CHECK(!ar1_request(0, 5, NULL, 0, NULL, 0, NULL, 0, &reply), "legacy renderer starts its output thread");
+    for (int i = 0; i < 100 && atomic_load(&audio_appends) < 8; i++) { struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL); }
+    CHECK(atomic_load(&audio_appends) >= 8 && atomic_load(&event_signals) >= 4, "output is replenished and frame events are signaled");
+    CHECK(!ar1_request(0, 6, NULL, 0, NULL, 0, NULL, 0, &reply) && !atomic_load(&audio_live) && atomic_load(&audio_closed) == 1,
+          "Stop joins the renderer before closing its PCM buffers");
+    CHECK(!ar1_request(0, 3, NULL, 0, NULL, 0, NULL, 0, &reply) && reply.value == 1, "stopped state is reported");
+    CHECK(!ar1_request(0, 5, NULL, 0, NULL, 0, NULL, 0, &reply), "stopped renderer can restart");
+    ar1_close();
+    CHECK(!atomic_load(&audio_live) && atomic_load(&audio_closed) == 2 && atomic_load(&event_live) == 1,
+          "Close joins the restarted output and preserves the client's event copy");
+    uint64_t close_copy[31] = {0x7002}; svc_thread(0x16, close_copy);
+    CHECK(!atomic_load(&event_live), "client releases the last event reference");
     munmap(guest, guest_size);
     printf("service/shared-memory: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

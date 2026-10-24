@@ -119,7 +119,7 @@ jobs:
           python -m unittest discover -s dm/tools/tests -p 'test_shader_mtarc.py'
           python -m unittest discover -s dm/tools/tests -p 'test_nso_masked_jumps.py'
           python -m unittest discover -s dm/tools/tests -p 'test_ci_ipa_inputs.py'
-          make -C dm/host/tests GAME=010015100B514000 sf
+          make -C dm/host/tests GAME=010015100B514000 sf dsp
 
       - name: Download game files and write keys
         if: ${{ !inputs.check_only }}

@@ -44,9 +44,9 @@ HLE_FORCE("_ZN2nn2sf4hipc20ConnectToHipcServiceEPNS_3svc6HandleEPKc", "connect t
 HLE_FORCE("_ZN2nn2sf4hipc24CloseClientSessionHandleENS_3svc6HandleE", "close a session (kernel handle) → the host session", void, h_sf_Close, uint32_t h) {
     int i = sf_slot(h);
     if (i < 0) { LOG("[RED] sf: CloseClientSessionHandle on %#x, not a host session", h); return; }
-    int audio = !strncmp(g_sf[i].name, "audren", 6);
+    int audio = !strcmp(g_sf[i].name, "audren");
     pthread_mutex_lock(&g_sf_mu); g_sf[i].used = 0;
-    if (audio) for (int k = 0; k < SF_MAX; k++) if (g_sf[k].used && !strncmp(g_sf[k].name, "audren", 6)) { audio = 0; break; }
+    if (audio) for (int k = 0; k < SF_MAX; k++) if (g_sf[k].used && !strcmp(g_sf[k].name, "audren")) { audio = 0; break; }
     pthread_mutex_unlock(&g_sf_mu);
     if (audio) ar1_close();
 }
@@ -131,7 +131,7 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     }
     if (audio) {
         int manager = !strcmp(g_sf[i].name, "audren:u");
-        if (dom) { LOG("[RED] audren legacy: domain IPC is not supported by the capture frontend"); return RES_FAIL; }
+        if (dom) { LOG("[RED] audren legacy: domain IPC is not supported by this renderer"); return RES_FAIL; }
         result = ar1_request(manager, cmd, base + hin + 16, data + ndw * 4 - hin - 16,
                             input, (int)na, output, (int)nb, &audio_reply);
         copy_handle = audio_reply.copy_handle;
