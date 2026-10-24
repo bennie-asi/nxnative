@@ -1,0 +1,175 @@
+name: Rebuild iPhone host
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: Successful run containing the previous encrypted IPA and diagnostics
+        type: string
+        required: true
+      title:
+        description: Base title ID of the previous IPA and prepared module bundle
+        type: string
+        required: true
+      package:
+        description: Prepared module version (must match the source IPA)
+        type: string
+        default: v0
+      check_only:
+        description: Run synthetic checks without downloading game data or needing secrets
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  rebuild:
+    runs-on: macos-26
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Check archive, shader identity and embedded game code handling
+        run: |
+          python -m unittest discover -s dm/tools/tests -p 'test_ci_rebuild_ipa.py'
+          make -C dm/host/tests GAME=010015100B514000 sf dsp
+      - name: Prepare the temporary rebuild directory
+        if: ${{ !inputs.check_only }}
+        env:
+          SOURCE_RUN: ${{ inputs.source_run }}
+          PROBE_TITLE: ${{ inputs.title }}
+          PROBE_PACKAGE: ${{ inputs.package }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ && "$PROBE_TITLE" =~ ^[0-9A-Fa-f]{16}$ && "$PROBE_PACKAGE" =~ ^v[0-9]+$ ]]
+          [[ -n "$IPA_PASSWORD" ]] || { echo 'IPA_PASSWORD is required.'; exit 1; }
+          printf 'NX_REBUILD_ROOT=%s\nNX_TITLE=%s\nGNUPGHOME=%s\n' \
+            "$RUNNER_TEMP/nxnative-rebuild" "$(printf '%s' "$PROBE_TITLE" | tr 'a-f' 'A-F')" "$RUNNER_TEMP/nxnative-rebuild-gnupg" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/nxnative-rebuild/input" "$RUNNER_TEMP/nxnative-rebuild-gnupg"
+          chmod 700 "$RUNNER_TEMP/nxnative-rebuild-gnupg"
+      - name: Free temporary runner space and install tools
+        if: ${{ !inputs.check_only }}
+        run: |
+          [[ "$(uname -m)" == arm64 ]]
+          if [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]; then
+            active_developer_dir="${DEVELOPER_DIR:-$(xcode-select -p)}"
+            active_xcode="$(cd "$active_developer_dir/../.." && pwd -P)"
+            for candidate in /Applications/Xcode_*.app; do
+              [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+              if [[ "$(cd "$candidate" && pwd -P)" != "$active_xcode" ]]; then sudo rm -rf -- "$candidate"; fi
+            done
+          fi
+          brew install xcodegen gnupg
+          df -h "$RUNNER_TEMP"
+      - name: Download the previous encrypted artifacts
+        if: ${{ !inputs.check_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > "$NX_REBUILD_ROOT/source-run.json"
+          source_attempt="$(python - "$NX_REBUILD_ROOT/source-run.json" <<'PY'
+          import json, sys
+          run = json.load(open(sys.argv[1]))
+          if run['status'] != 'completed' or run['conclusion'] != 'success':
+              raise SystemExit('The source run must have completed successfully.')
+          print(int(run['run_attempt']))
+          PY
+          )"
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name "nxnative-ipa-$SOURCE_RUN-$source_attempt" --dir "$NX_REBUILD_ROOT/input/ipa"
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name "nxnative-diagnostics-$SOURCE_RUN-$source_attempt" --dir "$NX_REBUILD_ROOT/input/diagnostics"
+          (cd "$NX_REBUILD_ROOT/input/ipa" && shasum -a 256 -c SHA256SUMS.txt)
+      - name: Decrypt inputs and get the exact prepared modules
+        if: ${{ !inputs.check_only }}
+        env:
+          CI_PROBE_JSON: ${{ secrets.CI_PROBE_JSON }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
+            --output "$NX_REBUILD_ROOT/input/source.ipa" "$NX_REBUILD_ROOT/input/ipa/game.ipa.gpg" <<< "$IPA_PASSWORD"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
+            --output "$NX_REBUILD_ROOT/input/diagnostics.tar.gz" "$NX_REBUILD_ROOT/input/diagnostics/diagnostics.tar.gz.gpg" <<< "$IPA_PASSWORD"
+          python dm/tools/ci_ipa_inputs.py download-probe --game-dir "$NX_REBUILD_ROOT/prepared"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
+            --output "$NX_REBUILD_ROOT/input/prepared.tar.gz" "$NX_REBUILD_ROOT/prepared/probe.tar.gz.gpg" <<< "$IPA_PASSWORD"
+          python - <<'PY'
+          import os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['NX_REBUILD_ROOT'])
+          for source, dest in [('diagnostics.tar.gz', 'diagnostics'), ('prepared.tar.gz', 'prepared')]:
+              with tarfile.open(root / 'input' / source) as archive:
+                  archive.extractall(root / dest, filter='data')
+          PY
+          rm -f -- "$NX_REBUILD_ROOT/input/ipa/game.ipa.gpg"
+      - name: Rebuild the host and repack the unsigned IPA
+        if: ${{ !inputs.check_only }}
+        env:
+          PROBE_PACKAGE: ${{ inputs.package }}
+        run: |
+          python dm/tools/ci_rebuild_ipa.py --ipa "$NX_REBUILD_ROOT/input/source.ipa" \
+            --diagnostics "$NX_REBUILD_ROOT/diagnostics" --prepared "$NX_REBUILD_ROOT/prepared" \
+            --work "$NX_REBUILD_ROOT/build" --title "$NX_TITLE" --package "$PROBE_PACKAGE" \
+            2>&1 | tee "$NX_REBUILD_ROOT/rebuild.log"
+      - name: Encrypt rebuild diagnostics
+        if: ${{ always() && !inputs.check_only }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          [[ -n "${NX_REBUILD_ROOT:-}" && -d "$NX_REBUILD_ROOT/build" && -n "$IPA_PASSWORD" ]] || exit 0
+          mkdir -p "$NX_REBUILD_ROOT/output" "$NX_REBUILD_ROOT/build/${NX_TITLE}_build/logs"
+          cp "$NX_REBUILD_ROOT/rebuild.log" "$NX_REBUILD_ROOT/build/${NX_TITLE}_build/logs/driver.log"
+          python dm/tools/ci_ipa_inputs.py diagnostics --game-dir "$NX_REBUILD_ROOT/build" \
+            --output "$NX_REBUILD_ROOT/diagnostics.tar.gz"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_REBUILD_ROOT/output/diagnostics.tar.gz.gpg" "$NX_REBUILD_ROOT/diagnostics.tar.gz" <<< "$IPA_PASSWORD"
+      - name: Upload encrypted rebuild diagnostics
+        if: ${{ always() && !inputs.check_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NX_REBUILD_ROOT }}/output/diagnostics.tar.gz.gpg
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: ignore
+      - name: Encrypt the repacked IPA
+        if: ${{ !inputs.check_only }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          mkdir -p "$NX_REBUILD_ROOT/output"
+          python dm/tools/ci_ipa_inputs.py check-encryption-space --game-dir "$NX_REBUILD_ROOT/build"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_REBUILD_ROOT/output/game.ipa.gpg" "$NX_REBUILD_ROOT/build/game.ipa" <<< "$IPA_PASSWORD"
+          (cd "$NX_REBUILD_ROOT/output" && shasum -a 256 game.ipa.gpg > SHA256SUMS.txt)
+      - name: Upload encrypted IPA
+        if: ${{ !inputs.check_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.NX_REBUILD_ROOT }}/output/game.ipa.gpg
+            ${{ env.NX_REBUILD_ROOT }}/output/SHA256SUMS.txt
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - name: Remove plaintext IPAs
+        if: ${{ always() && !inputs.check_only }}
+        run: |
+          [[ -n "${NX_REBUILD_ROOT:-}" ]] || exit 0
+          rm -f -- "$NX_REBUILD_ROOT/input/source.ipa" "$NX_REBUILD_ROOT/build/game.ipa"

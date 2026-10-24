@@ -87,6 +87,14 @@ Get-FileHash -Algorithm SHA256 -LiteralPath .\game.ipa.gpg
 
 Sign and install `game.ipa` using your Windows sideloading tool, such as [Sideloadly](https://sideloadly.io/). The IPA is unsigned; downloading it alone does not install it. Where supported by your signing setup, preserve the **Increased Memory Limit** entitlement for larger games (see the [README](../README.md#pack-an-ipa)). The workflow does not test the game on an iPhone.
 
+## Faster iterations on the iOS host
+
+After a successful full NVN build, **Rebuild iPhone host** can reuse that run's encrypted IPA and diagnostics. It recompiles the host and repacks the existing game data and iOS shader libraries, avoiding another game upload or shader compilation. The source artifacts must still exist, and `IPA_PASSWORD` must be the password used for them.
+
+Supply the successful source run ID, base title ID and package version. `CI_PROBE_JSON` must point to an encrypted prepared-module bundle as used by **Probe native SDK startup**. The tool checks the prepared modules byte for byte against every embedded module section in the old IPA, checks its rewriter metadata and shader-chain stamp, and refuses mismatches. The previous profile comes from the encrypted diagnostics. Source and result remain unsigned; the workflow never installs anything on a device. The output has the same encrypted artifact names and download procedure as a full build.
+
+Use this only for host changes. Different rewritten game code, a shader-chain change, new game data or changed shader inputs need a full build. Games with embedded NRO modules and OpenGL/Vulkan games also require a full build. `check_only` runs synthetic archive and module checks plus the service/audio tests without secrets or game files. Repacking successfully does not establish runtime or device compatibility.
+
 ## Space, costs and troubleshooting
 
 - **Disk space:** GitHub currently lists 14 GB of storage for standard Mac runners. Removing unused Xcode versions can free more, but available space varies with the image. The project estimates total build space as twice the input size plus 10 GB. After downloading, this workflow requires free space of at least the downloaded size plus 10 GiB. It checks again before encryption, which temporarily needs another IPA-sized copy plus a 1 GiB margin. `--no-keep-extracted` removes extracted files after a successful build; it does not reduce peak space needed during the build. Very large games may still need a Mac host with more storage.
