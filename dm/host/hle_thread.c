@@ -921,6 +921,16 @@ static int svc_thread_impl(int num, uint64_t *regs) {
 }
 
 // ---------- SystemEvent of the service layer ----------
+uint32_t hle_copy_event_handle(uint32_t handle) {
+    pthread_mutex_lock(&G);
+    event_t *event = h_peek(handle, O_EVENT_R);
+    int type = O_EVENT_R;
+    if (!event) { event = h_peek(handle, O_EVENT_W); type = O_EVENT_W; }
+    uint32_t copy = 0;
+    if (event) { event->refs++; copy = h_new(type, event); }
+    pthread_mutex_unlock(&G);
+    return copy;
+}
 // Real device: the service hands the read end of a kernel event to the client, and the guest waits on it through SDK nn::os. Host: on a guest thread, call the SDK's own
 // CreateSystemEvent(inter-process=true), and the SDK creates the kernel event through SVC 0x45; the write-end handle is recorded, after which any thread (including the host audio thread) can signal it.
 // The binding table (g_se) sits with the handle table at the top: CloseHandle unbinds through it

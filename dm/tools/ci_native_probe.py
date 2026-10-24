@@ -32,6 +32,7 @@ def main():
     g = game.load()
     logs = work / 'logs'; logs.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, DM_ROOT=str(work), WORK=str(work / 'tmp'))
+    env['DM_AUDREN_LEGACY_CAPTURE'] = str(logs / 'audren_legacy_capture.json')
     (work / 'tmp').mkdir(exist_ok=True)
     nsp.PROG.mode = 'lines'
     print('Prepared-module startup probe: RomFS assets may be absent; asset failures do not establish game compatibility.', flush=True)

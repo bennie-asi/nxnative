@@ -30,8 +30,8 @@ run: $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_commit_list $(B)/
 	$(B)/t_sf
 run: $(B)/t_nro
 run: $(B)/t_sf
-$(B)/t_sf: t_sf.c ../hle_sf.c ../hle_shmem.c ../hle.h ../dm.h $(GAME_H) | $(B)
-	clang -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_sf.c ../hle_shmem.c
+$(B)/t_sf: t_sf.c ../hle_sf.c ../hle_shmem.c ../hle_audren_legacy.c ../audren_legacy.h ../hle.h ../dm.h $(GAME_H) | $(B)
+	clang -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_sf.c ../hle_shmem.c ../hle_audren_legacy.c
 .PHONY: sf
 sf: $(B)/t_sf
 	$(B)/t_sf

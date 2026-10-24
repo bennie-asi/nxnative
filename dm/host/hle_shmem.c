@@ -9,7 +9,7 @@
 
 #define SHM_MAX 64
 #define SHM_MAP_MAX 128
-static struct { uint32_t handle; void *base; size_t size; } g_shm[SHM_MAX];
+static struct { uint32_t handle; void *base; size_t size; int owned; } g_shm[SHM_MAX];
 static struct { uint32_t handle, perm; uint64_t addr, size; } g_shm_maps[SHM_MAP_MAX];
 static uint32_t g_shm_next = 0xe0000;
 static pthread_mutex_t g_shm_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -21,7 +21,7 @@ uint32_t shared_memory_create(size_t size, void **backing) {
     pthread_mutex_lock(&g_shm_mu);
     int i = 0; while (i < SHM_MAX && g_shm[i].handle) i++;
     uint32_t handle = i < SHM_MAX ? g_shm_next++ : 0;
-    if (handle) { g_shm[i].handle = handle; g_shm[i].base = base; g_shm[i].size = size; *backing = base; }
+    if (handle) { g_shm[i].handle = handle; g_shm[i].base = base; g_shm[i].size = size; g_shm[i].owned = 1; *backing = base; }
     pthread_mutex_unlock(&g_shm_mu);
     if (!handle) munmap(base, size);
     return handle;
@@ -48,6 +48,19 @@ void shared_memory_free_bounds(uint64_t addr, uint64_t *lo, uint64_t *hi) {
 }
 
 int shared_memory_svc(int num, uint64_t *r) {
+    if (num == 0x15) {   // CreateTransferMemory(→w1 handle; x1 backing, x2 size, w3 owner permissions)
+        int dm_guest_as_contains(uintptr_t);
+        uint64_t addr = r[1], size = r[2];
+        if (!size || ((addr | size) & 0xfff) || addr + size < addr || !dm_guest_as_contains(addr) || !dm_guest_as_contains(addr + size - 1) || (r[3] != 0 && r[3] != 1 && r[3] != 3)) {
+            r[0] = 0xd401; return 1;
+        }
+        pthread_mutex_lock(&g_shm_mu);
+        int i = 0; while (i < SHM_MAX && g_shm[i].handle) i++;
+        uint32_t handle = i < SHM_MAX ? g_shm_next++ : 0;
+        if (handle) { g_shm[i].handle = handle; g_shm[i].base = (void *)addr; g_shm[i].size = size; g_shm[i].owned = 0; }
+        pthread_mutex_unlock(&g_shm_mu);
+        r[0] = handle ? 0 : 0xd401; r[1] = handle; return 1;
+    }
     if (num != 0x13 && num != 0x14 && num != 0x16) return 0;
     uint32_t handle = (uint32_t)r[0], result = 0;
     pthread_mutex_lock(&g_shm_mu);
@@ -58,11 +71,12 @@ int shared_memory_svc(int num, uint64_t *r) {
         r[0] = 0xe401; return 1;     // ResultInvalidHandle
     }
     if (num == 0x16) {
-        munmap(g_shm[i].base, g_shm[i].size); memset(&g_shm[i], 0, sizeof g_shm[i]);
+        if (g_shm[i].owned) munmap(g_shm[i].base, g_shm[i].size);
+        memset(&g_shm[i], 0, sizeof g_shm[i]);
     } else {
         uint64_t addr = r[1], size = r[2];
         int dm_guest_as_contains(uintptr_t);
-        if (!size || size != g_shm[i].size || addr % vm_page_size || size % vm_page_size ||
+        if (!g_shm[i].owned || !size || size != g_shm[i].size || addr % vm_page_size || size % vm_page_size ||
             !dm_guest_as_contains(addr) || !dm_guest_as_contains(addr + size - 1) || addr + size < addr) result = 0xd401;
         else if (num == 0x13) {
             uint32_t perm = (uint32_t)r[3]; int slot = -1, overlap = 0;

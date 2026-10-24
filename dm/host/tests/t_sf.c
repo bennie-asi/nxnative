@@ -7,6 +7,8 @@ static const size_t guest_size = 0x18000;
 int dm_guest_as_contains(uintptr_t a) { return a >= (uintptr_t)guest && a - (uintptr_t)guest < guest_size; }
 static int checks, failures;
 #define CHECK(c, msg) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)
+int svc_thread(int num, uint64_t *regs) { (void)num; (void)regs; CHECK(0, "audio event kernel calls are outside this fixture"); return 0; }
+uint32_t hle_copy_event_handle(uint32_t handle) { (void)handle; CHECK(0, "audio event copies are outside this fixture"); return 0; }
 
 static Result request(uint32_t handle, unsigned command, uint32_t arg, int domain, uint32_t *m) {
     memset(m, 0, 0x100);
@@ -61,6 +63,10 @@ int main(void) {
     CHECK(!h_sf_Connect(&session, "olsc:u"), "existing cloud settings service connects");
     CHECK(!request(session, 0, 0, 0, m) && !(m[1] >> 31), "existing zero-output service reply is unchanged");
     h_sf_Close(session);
+    CHECK(!h_sf_Connect(&session, "irs"), "a short-lived IRS client connects");
+    m[0] = 2; m[1] = 0;
+    CHECK(!h_sf_Send(session, m, 8), "HIPC Close needs no CMIF payload");
+    CHECK(h_sf_Dup(&handle, session) != 0, "HIPC Close releases its session");
     CHECK(h_sf_Connect(&session, "unknown") == 0xe15, "unregistered services remain unavailable");
 
     void *backing = NULL; handle = shared_memory_create(0x8000, &backing);
@@ -79,6 +85,19 @@ int main(void) {
         }
         CHECK(!memory_call(0x16, handle, NULL, 0, 0), "backing handle closes after unmap");
     }
+    CHECK(!mprotect(guest + 0x10000, 0x4000, PROT_READ | PROT_WRITE), "transfer-memory owner buffer is accessible");
+    guest[0x10000] = 0x75;
+    uint64_t transfer[4] = {0, (uintptr_t)guest + 0x10000, 0x4000, 0};
+    CHECK(shared_memory_svc(0x15, transfer) && !transfer[0] && transfer[1], "CreateTransferMemory returns a kernel handle");
+    CHECK(!memory_call(0x16, (uint32_t)transfer[1], NULL, 0, 0), "transfer-memory handle closes");
+    CHECK(guest[0x10000] == 0x75, "closing transfer memory preserves the owner's allocation");
+    uint32_t parameter[0x34 / 4] = {48000, 240}; parameter[0x30 / 4] = 0x31564552;
+    ar1_reply reply;
+    CHECK(!ar1_request(1, 1, (const uint8_t *)parameter, sizeof parameter, NULL, 0, NULL, 0, &reply) && reply.value_size == 8 && reply.value >= 0x1000,
+          "legacy renderer accepts its original REV1 parameter");
+    parameter[0x30 / 4] = 1;
+    CHECK(ar1_request(1, 1, (const uint8_t *)parameter, sizeof parameter, NULL, 0, NULL, 0, &reply) != 0,
+          "corrupting the old revision with a modern execution mode is rejected");
     munmap(guest, guest_size);
     printf("service/shared-memory: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

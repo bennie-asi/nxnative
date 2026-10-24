@@ -72,6 +72,7 @@ uint32_t shared_memory_create(size_t size, void **backing);
 int shared_memory_svc(int num, uint64_t *regs);
 int shared_memory_query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *perm);
 void shared_memory_free_bounds(uint64_t addr, uint64_t *lo, uint64_t *hi);
+uint32_t hle_copy_event_handle(uint32_t handle);   // a service returns a copied kernel event handle
 module_t *module_of(const void *p);
 // Gate dispatch: rewritten svc / timer reads come in through the common entry, ret_addr = the return point of that gate block, regs points to the saved x0..x30
 uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs);

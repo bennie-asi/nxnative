@@ -10,13 +10,14 @@
 // then the data words, whose CMIF part starts 16-byte aligned to the buffer: in a domain session the domain header {u8 type, u8 objects, u16 size, u32 object, u32, u32 token} first,
 // then {"SFCI", version, command, token} and the arguments. The response is the same with {u32 objects, 3 × u32} and {"SFCO", version, result, token}
 #include "hle.h"
+#include "audren_legacy.h"
 #include <pthread.h>
 
 #define SF_H0 0xd0000u   // session handles: outside the kernel handle table (0x1000 + slot, 4096 slots, hle_thread.c)
 #define SF_MAX 64
 static struct { char name[16]; int used, domain; unsigned seen; } g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
-static const char *const sf_served[] = {"olsc:u", "irs"};
+static const char *const sf_served[] = {"olsc:u", "irs", "audren:u"};
 
 static int sf_slot(uint32_t h) {
     unsigned i = h - SF_H0;
@@ -43,7 +44,11 @@ HLE_FORCE("_ZN2nn2sf4hipc20ConnectToHipcServiceEPNS_3svc6HandleEPKc", "connect t
 HLE_FORCE("_ZN2nn2sf4hipc24CloseClientSessionHandleENS_3svc6HandleE", "close a session (kernel handle) → the host session", void, h_sf_Close, uint32_t h) {
     int i = sf_slot(h);
     if (i < 0) { LOG("[RED] sf: CloseClientSessionHandle on %#x, not a host session", h); return; }
-    pthread_mutex_lock(&g_sf_mu); g_sf[i].used = 0; pthread_mutex_unlock(&g_sf_mu);
+    int audio = !strncmp(g_sf[i].name, "audren", 6);
+    pthread_mutex_lock(&g_sf_mu); g_sf[i].used = 0;
+    if (audio) for (int k = 0; k < SF_MAX; k++) if (g_sf[k].used && !strncmp(g_sf[k].name, "audren", 6)) { audio = 0; break; }
+    pthread_mutex_unlock(&g_sf_mu);
+    if (audio) ar1_close();
 }
 // Control requests: the pointer buffer is the server's receive buffer for X descriptors (none: the host reads them in place), the domain conversion makes the session's object 1, a duplicate
 // is a new session to the same object
@@ -68,17 +73,33 @@ HLE_FORCE("_ZN2nn2sf4hipc6client18DuplicateSessionExEPNS_3svc6HandleES4_j", "con
 HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request on a session (svcSendSyncRequest) → answered by the host for its sessions", Result, h_sf_Send,
           uint32_t h, uint32_t *m, uint64_t size) {
     int i = sf_slot(h);
-    if (i < 0 || size < 0x40) { LOG("[RED] sf: SendSyncRequest on %#x (%llu bytes), not a host session", h, (unsigned long long)size); return 0xe401u; }   // kernel ResultInvalidHandle
+    if (i < 0 || size < 8) { LOG("[RED] sf: SendSyncRequest on %#x (%llu bytes), not a host session", h, (unsigned long long)size); return 0xe401u; }   // kernel ResultInvalidHandle
+    if ((m[0] & 0xffff) == 2) { h_sf_Close(h); return RES_OK; }   // HIPC Close: no CMIF payload or response
+    if (size < 0x40) return 0xe401u;
     uint8_t *base = (uint8_t *)m;
-    unsigned type = m[0] & 0xffff, nx = m[0] >> 16 & 15, nabw = (m[0] >> 20 & 15) + (m[0] >> 24 & 15) + (m[0] >> 28 & 15), ndw = m[1] & 0x3ff;
+    unsigned type = m[0] & 0xffff, nx = m[0] >> 16 & 15, na = m[0] >> 20 & 15, nb = m[0] >> 24 & 15;
+    unsigned nabw = na + nb + (m[0] >> 28 & 15), ndw = m[1] & 0x3ff;
     uint32_t *p = m + 2;
     if (m[1] >> 31) { uint32_t sh = *p++; p += (sh & 1 ? 2 : 0) + (sh >> 1 & 15) + (sh >> 5 & 15); }   // special header: process ID, copy and move handles
-    p += nx * 2 + nabw * 3;
+    p += nx * 2;
+    if ((uint8_t *)(p + nabw * 3) > base + size) return 0xe401u;
+    ar1_buffer input[8], output[8]; int audio = !strncmp(g_sf[i].name, "audren", 6);
+    if (audio) {
+        if (na > 8 || nb > 8) return 0xe401u;
+        for (unsigned k = 0; k < na + nb; k++) {
+            const uint32_t *b = p + 3 * k;
+            uint64_t addr = b[1] | (uint64_t)(b[2] >> 28) << 32 | (uint64_t)(b[2] >> 2 & 7) << 36;
+            size_t bytes = b[0] | (uint64_t)(b[2] >> 24 & 15) << 32;
+            ar1_buffer value = {(void *)(uintptr_t)addr, bytes};
+            if (k < na) input[k] = value; else output[k - na] = value;
+        }
+    }
+    p += nabw * 3;
     size_t data = (size_t)((uint8_t *)p - base), cm = (data + 15) & ~(size_t)15;
     int dom = g_sf[i].domain && (type == 4 || type == 6);
     unsigned dtype = dom ? base[cm] : 1, obj = dom ? *(uint32_t *)(base + cm + 4) : 0;
     size_t hin = cm + (dom ? 16 : 0);
-    if (hin + 16 > size || data + ndw * 4 > size) { LOG("[RED] sf: %s: request of %u data words does not fit %llu bytes", g_sf[i].name, ndw, (unsigned long long)size); return 0xe401u; }
+    if (hin + 16 > size || data + ndw * 4 > size || data + ndw * 4 < hin + 16) { LOG("[RED] sf: %s: request of %u data words does not fit %llu bytes", g_sf[i].name, ndw, (unsigned long long)size); return 0xe401u; }
     uint32_t magic = *(uint32_t *)(base + hin), ver = *(uint32_t *)(base + hin + 4), cmd = *(uint32_t *)(base + hin + 8);
     static int trace = -1; if (trace < 0) trace = getenv("DM_SF_TRACE") && atoi(getenv("DM_SF_TRACE"));
     if (trace) { char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x80 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]); LOG("sf: %s request: %s", g_sf[i].name, hx); }
@@ -91,7 +112,8 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     // main+0xacd240 dereferences a null service after ConnectToHipcService("irs")
     // is refused. Model the registered service with nine disconnected IR cameras.
     // Layout and command IDs: libnx nx/source/services/irs.c and services/irs.h.
-    uint32_t result = RES_OK, copy_handle = 0, camera = 0;
+    uint32_t result = RES_OK, copy_handle = 0, move_handle = 0, camera = 0;
+    ar1_reply audio_reply = {0};
     int irs = !strcmp(g_sf[i].name, "irs");
     if (irs) {
         if (cmd == 304) {   // GetIrsensorSharedMemoryHandle: a copied handle to 0x8000 bytes
@@ -106,15 +128,25 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
             if (camera > 8) result = 0xdccd;   // IRS: no connected camera
         } else if (cmd != 302 && cmd != 303 && cmd != 305 && cmd != 318) result = 0xdccd;
     }
+    if (audio) {
+        int manager = !strcmp(g_sf[i].name, "audren:u");
+        if (dom) { LOG("[RED] audren legacy: domain IPC is not supported by the capture frontend"); return RES_FAIL; }
+        result = ar1_request(manager, cmd, base + hin + 16, data + ndw * 4 - hin - 16,
+                            input, (int)na, output, (int)nb, &audio_reply);
+        copy_handle = audio_reply.copy_handle;
+        if (!result && audio_reply.new_session) move_handle = sf_new("audren", 0);
+    }
     if (first || trace) LOG("sf: %s object %u command %u (%u data words in): result %#x", g_sf[i].name, obj, cmd, ndw, result);
     // The response: no special header and no descriptors, so the data words start at +8 and the CMIF part at +0x10; everything after the headers up to the buffer's end reads as zero
     size_t end = size < 0x1000 ? size : 0x1000;
     memset(base, 0, end);
-    size_t head = copy_handle ? 16 : 8;
+    size_t head = copy_handle || move_handle ? 16 : 8;
     m[1] = (uint32_t)((end - head) / 4 < 0x3ff ? (end - head) / 4 : 0x3ff);
     if (copy_handle) { m[1] |= 1u << 31; m[2] = 2; m[3] = copy_handle; }
+    if (move_handle) { m[1] |= 1u << 31; m[2] = 1u << 5; m[3] = move_handle; }
     size_t out = 0x10 + (dom ? 16 : 0);
     uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = result; o[3] = 0;   // "SFCO"; a domain's out-object count before it stays 0
     if (irs && cmd == 311 && out + 20 <= end) o[4] = camera;
+    if (audio && audio_reply.value_size && out + 16 + audio_reply.value_size <= end) memcpy(o + 4, &audio_reply.value, audio_reply.value_size);
     return RES_OK;
 }
