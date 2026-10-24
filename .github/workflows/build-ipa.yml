@@ -109,6 +109,13 @@ jobs:
           dotnet --version
           df -h "$RUNNER_TEMP"
 
+      - name: Run extraction and shader regression checks
+        run: |
+          python -m unittest discover -s dm/tools/tests -p 'test_nsp_*.py'
+          python -m unittest discover -s dm/tools/tests -p 'test_shader_mtarc.py'
+          python -m unittest discover -s dm/tools/tests -p 'test_nso_masked_jumps.py'
+          python -m unittest discover -s dm/tools/tests -p 'test_ci_ipa_inputs.py'
+
       - name: Download game files and write keys
         if: ${{ !inputs.check_only }}
         env:

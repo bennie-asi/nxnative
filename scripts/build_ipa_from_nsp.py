@@ -351,11 +351,14 @@ def rmtree(p):
 def build_nx_extract(repo, work, logs, env):
     """Build nx_extract into <work>/tools/nx_extract/. It is built in a temporary folder and copied over: with an apostrophe in the output path (e.g. "Bowser's Fury") MSBuild's conditions break,
     LibHac.dll and the executable are not copied, and the build still reports success"""
-    nx = work / 'tools/nx_extract/nx_extract'
+    executable = 'nx_extract.exe' if sys.platform == 'win32' else 'nx_extract'
+    nx = work / 'tools/nx_extract' / executable
     with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
-        run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
-        if not (Path(t) / 'nx_extract').exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-        rmtree(nx.parent); shutil.copytree(t, nx.parent)
+        out, obj = Path(t) / 'out', Path(t) / 'obj'
+        run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', out, '-v', 'quiet', '-nologo',
+             f'-p:BaseIntermediateOutputPath={obj.as_posix()}/', f'-p:MSBuildProjectExtensionsPath={obj.as_posix()}/'], logs / 'nx_extract_build.log', env=env)
+        if not (out / executable).exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
+        rmtree(nx.parent); shutil.copytree(out, nx.parent)
     return nx
 
 
@@ -448,6 +451,31 @@ def can_clone(d):   # whether this volume supports APFS clones (nx_extract uses 
         return ctypes.CDLL(None, use_errno=True).clonefile(str(a).encode(), str(b).encode(), 0) == 0
     finally:
         rmtree(a); rmtree(b)
+
+
+def xci_updates(repo, nsp_dir, app, fam, keys, env):
+    """Find embedded updates from CNMT, not a filename's version tag; base and patch can share one XCI."""
+    paths = sorted(nsp_dir.glob('*.xci'))
+    if not paths: return
+    if not shutil.which('dotnet', path=env['PATH']): raise BuildError('dotnet not found (.NET SDK 10)')
+    work = nsp_dir / f'{app:016X}_build'
+    logs = work / 'logs'; logs.mkdir(parents=True, exist_ok=True)
+    PROG.plan(1); PROG.stage('inspect XCI content metadata')
+    nx = build_nx_extract(repo, work, logs, env)
+    versions = {v for v, _ in fam['updates']}
+    for i, path in enumerate(paths):
+        log = logs / f'xci_catalog_{i}.log'
+        run([nx, '--inspect', keys, path], log, env=env)
+        records = json.loads(log.read_text(encoding='utf-8'))
+        applications = {int(r['title_id'], 16) for r in records if r['type'] == 'Application'}
+        if applications != {app}: raise BuildError(f'{path.name}: content metadata does not describe just game {app:016X}')
+        for record in records:
+            if record['type'] == 'Patch' and int(record['title_id'], 16) == app + 0x800:
+                version = int(record['version'])
+                if version not in versions:
+                    fam['updates'].append((version, path)); versions.add(version)
+                    say(f'embedded update v{version}: {path.name}')
+    PROG.end(f'{len(paths)} XCI, {len(versions)} update version(s)')
 
 
 # ---- Survey of a new game (when no game profile matches) ----
@@ -1530,6 +1558,7 @@ def main(args=None):
     env.setdefault('J', str(os.cpu_count() or 8))   # shader_split.py's and dmsh_build.py's workers (their default is 8)
     py = sys.executable
     app, fam = scan_nsps(nsp_dir)
+    xci_updates(repo, nsp_dir, app, fam, keys, env)
     force = args.provisional or PROVISIONAL   # a provisional profile even when dm/games has one (testing the guesses)
     g, provisional, shadowed = None if force else gamemod.by_title(app), False, False
     if g is None:   # no game profile: survey, then (unless --survey-only) a provisional profile outside the repository and a best-effort IPA

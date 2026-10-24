@@ -10,6 +10,8 @@ Put your own base game NSP or XCI, and optionally its update and DLC NSPs, in pr
 
 Keep the title ID and version tags in the filenames, especially `[v<N>]` for updates. Include only one game, its updates and its DLC. The build packs the newest supplied update unless you select another version when dispatching it.
 
+A combined XCI can hold both the base game and an update. The extractor reads its content metadata (CNMT), selects the actual patch version, and pairs that patch's Program and Control contents. Supply the XCI once; an update tag in its filename alone does not prove that a patch is present. An explicit update NSP takes precedence over an embedded update of the same version.
+
 In your repository, open **Settings > Secrets and variables > Actions > Secrets > New repository secret**. Add a secret named **`GAME_FILES_JSON`** with a JSON array like this (replace the example URLs with your own):
 
 ```json
@@ -59,7 +61,7 @@ The uploaded file is always encrypted with GnuPG AES-256 and integrity protectio
 | `app_name` | Optional home-screen name. Empty keeps the game's name. |
 | `package` | Optional NSP version tag, such as `v327680` or `v0`. Empty selects the newest supplied version. |
 | `free_disk_space` | Enabled by default. Removes unused Xcode installations on this temporary GitHub-hosted VM, preserving the selected Xcode. |
-| `check_only` | Checks dependency installation, ARM64 architecture and the iOS/macOS Metal compilers, without secrets, game downloads or an IPA. Useful for checking the runner first. |
+| `check_only` | Checks dependency installation, ARM64 architecture, the iOS/macOS Metal compilers and data-free regression tests, without secrets, game downloads or an IPA. Useful for checking the runner first. |
 
 The normal build validates the secrets, installs dependencies, downloads the game, checks disk space, runs `scripts/build_ipa_from_nsp.py`, encrypts the IPA, and uploads it. Build progress and failure details appear in the job's steps. The job has a 350-minute timeout, leaving some room within GitHub's hosted-job limit.
 

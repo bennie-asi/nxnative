@@ -8,8 +8,11 @@
 // The base game may also be a cartridge dump (.xci, Monster Hunter Rise): its secure partition holds the NCAs, which carry their keys in the key area (no ticket).
 using System;
 using System.Collections.Generic;
+using System.Buffers.Binary;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using LibHac.Common;
 using LibHac.Common.Keys;
 using LibHac.Fs;
@@ -28,13 +31,21 @@ static class P {
     static int Main(string[] a) {
         bool manifest = Array.IndexOf(a, "--manifest") >= 0; a = Array.FindAll(a, s => s != "--manifest");
         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
+        if (a.Length == 3 && a[0] == "--inspect") {
+            var pkg = OpenNsp(ExternalKeyReader.ReadKeyFile(a[1]), a[2]);
+            Console.WriteLine(JsonSerializer.Serialize(pkg.Records.Select(r => new {
+                title_id = r.TitleId.ToString("X16"), version = r.Version,
+                type = r.Type == 0x80 ? "Application" : r.Type == 0x81 ? "Patch" : r.Type.ToString("X2")
+            })));
+            return 0;
+        }
         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>"); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3]);
         var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
         Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
-        Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId) ?? throw new Exception("no Program NCA of the base game's program in the update NSP");
-        Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control, baseProg.Header.TitleId);
+        Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId, patch: true) ?? throw new Exception("no Program NCA of the base game's program in the update NSP");
+        Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control, baseProg.Header.TitleId, patch: updPkg != null);
         Console.WriteLine($"title {baseProg.Header.TitleId:x16}" + (updProg != null ? $", update {updProg.Header.TitleId:x16}" : ""));
         string outDir = a[3], cmpDir = a.Length > 4 ? a[4] : null;
         if (ctrl != null) {   // control data (NACP): display version and game name; a raw copy goes to <output dir>/control.nacp for naming the app
@@ -94,7 +105,16 @@ static class P {
     }
 
     // Open an NSP (PFS0) or the secure partition of an XCI, import the common tickets, list all NCAs
-    static List<Nca> OpenNsp(KeySet ks, string path) {
+    sealed class ContentRecord {
+        public ulong TitleId;
+        public uint Version;
+        public byte Type;
+        public List<Nca> Contents = new();
+    }
+    sealed class Package : List<Nca> {
+        public List<ContentRecord> Records = new();
+    }
+    static Package OpenNsp(KeySet ks, string path) {
         IFileSystem pfs; var st0 = new LocalStorage(path, FileAccess.Read);
         byte[] magic = new byte[4]; st0.Read(0x100, magic).ThrowIfFailure();
         if (System.Text.Encoding.ASCII.GetString(magic) == "HEAD") {   // XCI: the card header's magic at 0x100
@@ -104,7 +124,8 @@ static class P {
         } else {
             var p = new PartitionFileSystem(); p.Initialize(st0).ThrowIfFailure(); pfs = p;
         }
-        var ncas = new List<Nca>();
+        var ncas = new Package();
+        var byId = new Dictionary<string, Nca>(StringComparer.OrdinalIgnoreCase);
         foreach (DirectoryEntryEx e in pfs.EnumerateEntries("*", SearchOptions.Default)) {
             using var f = new UniqueRef<IFile>();
             pfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
@@ -113,15 +134,54 @@ static class P {
                 byte[] t = new byte[0x2c0]; st.Read(0, t).ThrowIfFailure();
                 if (t[0x281] != 0) { Console.Error.WriteLine($"[RED] {e.Name} is not a common ticket; supply the title key separately"); continue; }
                 ks.ExternalKeySet.Add(new RightsId(t.AsSpan(0x2a0, 0x10)), new AccessKey(t.AsSpan(0x180, 0x10))).ThrowIfFailure();
-            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) ncas.Add(new Nca(ks, st));
+            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) {
+                var nca = new Nca(ks, st); ncas.Add(nca);
+                if (e.Name.Length >= 32) byId[e.Name[..32]] = nca;
+            }
+        }
+        // A combined XCI can contain a base and patch Program with the same header title ID.
+        // Their CNMT content IDs identify the correct Program/Control pair; file order cannot.
+        foreach (var meta in ncas.Where(n => n.Header.ContentType == NcaContentType.Meta)) {
+            var fs = meta.OpenFileSystem(0, IntegrityCheckLevel.ErrorOnInvalid);
+            foreach (var entry in fs.EnumerateEntries("*.cnmt", SearchOptions.Default)) {
+                using var file = new UniqueRef<IFile>();
+                fs.OpenFile(ref file.Ref, entry.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+                file.Get.GetSize(out long length).ThrowIfFailure();
+                if (length < 0x20 || length > 4 * 1024 * 1024) throw new InvalidDataException("invalid CNMT size");
+                var data = new byte[(int)length];
+                file.Get.Read(out long read, 0, data, ReadOption.None).ThrowIfFailure();
+                if (read != length) throw new InvalidDataException("truncated CNMT");
+                var record = new ContentRecord {
+                    TitleId = BinaryPrimitives.ReadUInt64LittleEndian(data),
+                    Version = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(8)), Type = data[0xC]
+                };
+                int start = 0x20 + BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(0xE));
+                int count = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(0x10));
+                if ((long)start + count * 0x38L > length) throw new InvalidDataException("truncated CNMT content table");
+                for (int i = 0; i < count; i++) {
+                    string id = Convert.ToHexString(data.AsSpan(start + i * 0x38 + 0x20, 16));
+                    if (byId.TryGetValue(id, out var nca)) record.Contents.Add(nca);
+                }
+                ncas.Records.Add(record);
+            }
         }
         return ncas;
     }
     // A multi-program application has a Program and a Control NCA per program index (ROMANCE OF THE THREE KINGDOMS 8 REMAKE: its update 1.1.3 adds a whole second program,
     // title ID …0001, beside the game's patch, …0000): with no title ID the lowest one (program index 0, the game), else the NCA of that title ID
-    static Nca Pick(List<Nca> l, NcaContentType t, ulong? id = null) {
+    static Nca Pick(Package l, NcaContentType t, ulong? id = null, bool patch = false) {
+        IEnumerable<Nca> candidates = l;
+        if (l.Records.Count > 0) {
+            ulong? app = id.HasValue ? id.Value & ~0xFFFUL : null;
+            byte type = patch ? (byte)0x81 : (byte)0x80;
+            var record = l.Records.Where(r => r.Type == type &&
+                (!app.HasValue || r.TitleId == app.Value + (patch ? 0x800UL : 0)))
+                .OrderBy(r => r.TitleId).ThenByDescending(r => r.Version).FirstOrDefault();
+            if (record != null) candidates = record.Contents;
+            else if (t == NcaContentType.Program || t == NcaContentType.Control) return null;
+        }
         Nca r = null;
-        foreach (Nca n in l) if (n.Header.ContentType == t && (id == null ? r == null || n.Header.TitleId < r.Header.TitleId : n.Header.TitleId == id)) r = n;
+        foreach (Nca n in candidates) if (n.Header.ContentType == t && (id == null ? r == null || n.Header.TitleId < r.Header.TitleId : n.Header.TitleId == id)) r = n;
         return r;
     }
 

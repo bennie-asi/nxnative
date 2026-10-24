@@ -513,6 +513,28 @@ def check_before_copy(insl, ctx, ld, idx):
         if writes(p) & (idx | {src}): return None
     else: return None
     return ctx[k - 2]
+def masked_index_count(ctx, ld, index):
+    """A low-bit AND is a bounds check of its own (Revelations main+0x8bb5fc:
+    and x18,x17,#0xf; ldrsw x18,[x13,x18,lsl #2]). Only the last writer counts;
+    An immediately preceding tbnz on the source rules out that bit on the fallthrough
+    (the same dispatch checks bit 3 before masking with 0xf, so only 8 entries exist).
+    Non-contiguous masks and tables larger than 65,536 entries are not inferred."""
+    index = 'w' + index[1:]
+    for p in reversed(ctx[:ctx.index(ld)]):
+        if p.mnemonic in ('cmp', 'cmn', 'tst'): continue
+        if index not in {'w' + p.reg_name(r)[1:] for r in p.regs_access()[1]}: continue
+        m = re.fullmatch(r'([wx]\d+), ([wx]\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'and' else None
+        if not m or 'w' + m.group(1)[1:] != index: return None
+        mask = int(m.group(3), 0)
+        at = ctx.index(p)
+        if at:
+            guard = ctx[at - 1]
+            if guard.mnemonic == 'tbnz' and 'w' + guard.reg_name(guard.operands[0].reg)[1:] == 'w' + m.group(2)[1:] and guard.operands[2].imm > ld.address:
+                mask &= ~(1 << guard.operands[1].imm)
+        return mask + 1 if 0 <= mask <= 0xFFFF and mask & (mask + 1) == 0 else None
+    return None
+
+
 def jump_offsets(insl, j, copy_first=False, far_base=False):
     """The br x18 is preceded by the offset-table form (Engage main+0x12eec94): cmp w18,#N; b.hi; ldrsw x18,[xB,x18,lsl #2]; add x18,x18,xB.
     The index may be another register, and the bounds check may be on a register copied into it: Link's Awakening's GLSLC (subsdk0+0x1be6e8) has
@@ -523,14 +545,25 @@ def jump_offsets(insl, j, copy_first=False, far_base=False):
     256 instructions was set further back, and its writer chain is followed to the function's start (table_base far), every target an instruction of the function: ASTRAL CHAIN main+0x6db498
     and +0x6db70c load bases set 441 and 549 instructions before, x24 in the function's first block and x3 after it, which the loop around their dispatches keeps. A function-wide search
     for the one adrp + add pair that fits (table_cands, as jump_adr_offsets does) finds two for x3 there, the other a table of its own further on. Returns all targets, or None if not recognized"""
-    ctx = insl[max(0, j - 16):j]
+    # Clang in SDK 1.6 schedules constant loads across the dispatch (Revelations
+    # main+0x982008: the ldrsw is 19 instructions before br). Widen only the last
+    # attempt, and require the loaded entry/target not to be overwritten below.
+    ctx = insl[max(0, j - (64 if far_base else 16)):j]
     add = next((p for p in reversed(ctx) if p.mnemonic == 'add' and re.fullmatch(r'x18, x\d+, x\d+', p.op_str)), None)
     if not add: return None
     _, t, rb = add.op_str.split(', ')   # t = the loaded entry, rb = the table base
-    ld = next((p for p in reversed(ctx) if p.mnemonic == 'ldrsw' and re.fullmatch(rf'{t}, \[{rb}, x(\d+), lsl #2\]', p.op_str)), None)
+    ld = next((p for p in reversed(ctx[:ctx.index(add)]) if p.mnemonic == 'ldrsw' and re.fullmatch(rf'{t}, \[{rb}, x(\d+), lsl #2\]', p.op_str)), None)
     if not ld: return None
+    if far_base:
+        def changed(p, registers):
+            if p.mnemonic in ('bl', 'blr'): return True
+            if p.mnemonic in ('cmp', 'cmn', 'tst'): return False
+            return any(p.reg_name(r).replace('w', 'x', 1) in registers for r in p.regs_access()[1])
+        if any(changed(p, {t, rb}) for p in ctx[ctx.index(ld) + 1:ctx.index(add)]): return None
+        if any(changed(p, {'x18'}) for p in ctx[ctx.index(add) + 1:]): return None
     # GLSLC subsdk0+0x2f403c checks a masked copy instead: and w16,w18,#0x3f; cmp w16,#0xe; b.hi; ...; and x18,x18,#0x3f; ldrsw x18,[x15,x18,lsl #2]
-    idx = {'w' + re.fullmatch(rf'{t}, \[{rb}, x(\d+), lsl #2\]', ld.op_str).group(1)}
+    index = 'w' + re.fullmatch(rf'{t}, \[{rb}, x(\d+), lsl #2\]', ld.op_str).group(1)
+    idx = {index}
     masked = None   # (source, mask, position) when the index is "source & mask"
     k0 = ctx.index(ld); cmp = None
     def wname(r): return 'w' + r[1:]
@@ -554,8 +587,11 @@ def jump_offsets(insl, j, copy_first=False, far_base=False):
                 break
             if cmp: break
     if not cmp and copy_first: cmp = check_before_copy(insl, ctx, ld, idx)
-    if not cmp: return None
-    n = int(cmp.op_str.split('#')[1], 0) + 1
+    mask_bound = cmp is None
+    if mask_bound:
+        n = masked_index_count(ctx, ld, index) if far_base else None
+        if n is None: return None
+    else: n = int(cmp.op_str.split('#')[1], 0) + 1
     k = insl.index(ld); lo = page = None
     for p in reversed(insl[max(0, k - 256):k]):   # the writer chain of the table base
         _, w = p.regs_access()
@@ -583,7 +619,12 @@ def jump_offsets(insl, j, copy_first=False, far_base=False):
         return t if all(fa <= x < fb and x % 4 == 0 for x in t) else None
     if page is None: return None
     tb = page + lo
-    return [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+    if tb < 0 or tb + 4 * n > len(IMG): return None
+    targets = [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+    if mask_bound:
+        fa, fb = insl[0].address, insl[-1].address + 4
+        if not all(fa <= x < fb and x % 4 == 0 for x in targets): return None
+    return targets
 def table_base(insl, k, rb, far=False):
     """Address the table-base register rb holds at insl[k]: its writer chain before k must be add rb,rb,#lo after adrp rb (as in jump_offsets); None otherwise.
     The chain is searched 256 instructions back, or with far to the function's start, through no call when rb is caller-saved (capstone lists only x30 as a call's write; a call between

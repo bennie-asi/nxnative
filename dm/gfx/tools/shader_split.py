@@ -437,11 +437,20 @@ def mtarc_members(d, label):
     stored length equals the length. → (path, data) of each entry"""
     import zlib
     ver, n = struct.unpack_from('<HH', d, 4)
-    if ver != 7: red(f'{label}: ARC version {ver}: only version 7 is known')
+    if ver not in (7, 9): red(f'{label}: ARC version {ver}: only versions 7 and 9 are known')
+    # Revelations (SDK 1.6) uses ARC 9: 64-byte paths and a separate flags word.
+    # Its root shader member is 651,519,592 bytes: masking the
+    # size to 29 bits as for ARC 7 truncates it by 512 MiB.
+    stride, path_len = (0x90, 0x80) if ver == 7 else (0x54, 0x40)
+    if 8 + n * stride > len(d): red(f'{label}: truncated ARC entry table')
     for i in range(n):
-        o = 8 + 0x90 * i
-        path = d[o:o + 0x80].split(b'\0')[0].decode('latin-1')
-        csz, usz, off = struct.unpack_from('<3I', d, o + 0x84); usz &= 0x1fffffff
+        o = 8 + stride * i
+        path = d[o:o + path_len].split(b'\0')[0].decode('latin-1')
+        if ver == 7:
+            csz, usz, off = struct.unpack_from('<3I', d, o + 0x84); usz &= 0x1fffffff
+        else:
+            csz, usz, flags, off = struct.unpack_from('<4I', d, o + 0x44)
+        if off + csz > len(d): red(f'{label}#{path}: ARC entry data out of bounds')
         data = d[off:off + csz] if csz == usz else zlib.decompress(d[off:off + csz])
         if len(data) != usz: red(f'{label}#{path}: {len(data):#x} bytes, the entry says {usz:#x}')
         yield path.replace('\\', '/'), data
@@ -452,17 +461,27 @@ def mtspk_shaders(d, label):
     so the code area is the bytes right before it, and every block must start where the previous one ended. The tables that say which vertex and pixel shaders the engine combines are not
     read, so the shaders are paired as single-stage programs (separable_pairs)"""
     out, end, c = [], None, d.find(CTL_MAGIC)
+    control_first = None
     while c >= 0:
+        if c + 0x708 > len(d): red(f'{label} SPK: truncated control section @{c:#x}')
         nctl, ncode = struct.unpack_from('<I', d, c + 0x20)[0], struct.unpack_from('<I', d, c + 0x704)[0]
-        a = c - ncode
-        if a < 0 or d[a:a + 4] != GFX_MAGIC or end is not None and a != end: red(f'{label} SPK control section @{c:#x}: its code area does not end right before it')
-        ctl, code = d[c:c + nctl], d[a:c]
+        if control_first is None:
+            # SDK 1.6's SPK (Revelations) puts a 0x838-byte control before its code,
+            # with per-record metadata between shaders. Newer SPKs put code first.
+            before = c >= ncode and d[c - ncode:c - ncode + 4] == GFX_MAGIC
+            control_first = not before and d[c + nctl:c + nctl + 4] == GFX_MAGIC
+        a = c + nctl if control_first else c - ncode
+        if a < 0 or a + ncode > len(d) or c + nctl > len(d): red(f'{label} SPK @{c:#x}: shader sections out of bounds')
+        if d[a:a + 4] != GFX_MAGIC or not control_first and end is not None and a != end:
+            red(f'{label} SPK control section @{c:#x}: inconsistent code area layout')
+        ctl, code = d[c:c + nctl], d[a:a + ncode]
         st = sph_stage(code)
         why = check(label, st, ctl, code) if st else 'no stage in the SPH'
         if why: red(f'{label} SPK @{a:#x}: {why}')
         out.append((f'{label}#MTSPK@{a:#x}', st, ctl, code))
-        end = c + nctl; c = d.find(CTL_MAGIC, end)
-    if end != len(d): red(f'{label} SPK: the last shader ends at {end}, not at the end of the package ({len(d):#x})')
+        end = a + ncode if control_first else c + nctl
+        c = d.find(CTL_MAGIC, end)
+    if not control_first and end != len(d): red(f'{label} SPK: the last shader ends at {end}, not at the end of the package ({len(d):#x})')
     return out
 
 def mtarc_shaders(d, label, out):
@@ -1182,7 +1201,7 @@ def main():
     files, results, common = [], [], None
     for i, (romfs, mainnso) in enumerate(zip(romfs_v, main_v)):
         tag = os.path.basename(os.path.dirname(os.path.abspath(romfs))) if i else ''
-        files += sorted((os.path.join(dp, f), (tag + '/' if tag else '') + os.path.relpath(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs)
+        files += sorted((os.path.join(dp, f), (tag + '/' if tag else '') + os.path.relpath(os.path.join(dp, f), romfs).replace(os.sep, '/')) for dp, _, fs in os.walk(romfs) for f in fs)
         img = nso_image(mainnso)
         if not i:
             import unityfs
