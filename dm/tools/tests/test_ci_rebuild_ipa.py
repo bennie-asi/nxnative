@@ -37,6 +37,9 @@ class EmbeddedCodeTests(unittest.TestCase):
             with self.subTest(far=far), tempfile.TemporaryDirectory() as temporary:
                 app, patched, executable = fixture(Path(temporary), far)
                 self.assertEqual(ci.verify_modules(app, executable, patched, ['main']), 1)
+                recovered = ci.recover_modules(app, executable, ['main'], Path(temporary) / 'recovered')
+                self.assertEqual((recovered / 'main.patched.bin').read_bytes(), (patched / 'main.patched.bin').read_bytes().ljust(0xc000, b'\0'))
+                self.assertEqual(ci.verify_modules(app, executable, recovered, ['main']), 1)
                 with executable.open('r+b') as target: target.seek(0x9001); target.write(b'changed')
                 with self.assertRaisesRegex(ci.RebuildError, 'Embedded code differs'):
                     ci.verify_modules(app, executable, patched, ['main'])

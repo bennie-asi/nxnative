@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rebuild only the host of a previous unsigned NVN IPA, preserving game resources.
 
-Requires the previous build's decrypted diagnostics and the exact prepared module
-bundle. Shader-chain changes and different rewritten modules require a full build.
+Recovers the exact rewritten modules from the previous executable, using its
+rewriter tables. Shader-chain changes and different game code need a full build.
 This tool never signs, installs, or claims runtime compatibility.
 """
 import argparse
@@ -124,6 +124,34 @@ def verify_modules(app, executable, patched, modules):
     return len(modules)
 
 
+def recover_modules(app, executable, modules, destination):
+    """Undo gen_embed's three-piece placement, preserving its page padding."""
+    if (app / 'dm/nro.tsv').exists(): raise RebuildError('Embedded NRO modules require a full build')
+    sections = macho_sections(executable); destination.mkdir(parents=True)
+    with executable.open('rb') as source:
+        for module in modules:
+            if not re.fullmatch('[A-Za-z0-9_]+', module): raise RebuildError('Invalid module name')
+            table = app / 'dm' / f'{module}.fixups.tsv'
+            header = dict(line[2:].split() for line in table.read_text().splitlines() if line.startswith('# '))
+            start = (int(header['TEXT_END'], 16) + 0x3fff) & ~0x3fff
+            patch = int(header['PATCH_OFF'], 16)
+            split = patch if patch >= 0 else int(header['FILE_IMAGE_LEN'], 16)
+            labels = [('__TEXT', f'__dm{module}x0'), (f'__DM{module}W', '__img'), ('__TEXT', f'__dm{module}x1')]
+            extents = [sections.get(label) for label in labels]
+            if (split < start or any(item is None for item in extents) or
+                    extents[0][1] != start or extents[1][1] != split-start):
+                raise RebuildError(f'Embedded layout differs for {module}; run a full build')
+            with (destination / f'{module}.patched.bin').open('wb') as output:
+                for offset, length in extents:
+                    source.seek(offset); remaining = length
+                    while remaining:
+                        block = source.read(min(2**20, remaining))
+                        if not block: raise RebuildError('Truncated embedded module')
+                        output.write(block); remaining -= len(block)
+            shutil.copy2(table, destination / table.name)
+    return destination
+
+
 def require_chain(app, repo, title=None):
     match = re.search(r'#define DMSH_CHAIN "([0-9a-f]+)"', (repo / 'dm/gfx/nvn/dmsh_chain.h').read_text())
     if not match: raise RebuildError('No current shader-chain version')
@@ -150,7 +178,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ipa', required=True, type=Path)
     parser.add_argument('--diagnostics', required=True, type=Path)
-    parser.add_argument('--prepared', required=True, type=Path)
     parser.add_argument('--work', required=True, type=Path)
     parser.add_argument('--title', required=True)
     parser.add_argument('--package', default='v0')
@@ -176,7 +203,7 @@ def main(argv=None):
     g = game.Game(profile)
     if g.get('title_id').upper() != title or g.get('package') != args.package:
         raise RebuildError('Profile title/version differs from the requested source')
-    patched = args.prepared / f'{title}_build' / f'patched_{args.package}'
+    patched = recover_modules(app, app / executable_name, g.words('modules'), work / 'recovered_modules')
     count = verify_modules(app, app / executable_name, patched, g.words('modules'))
     print(f'Verified all embedded sections of {count} modules and shader chain {chain}.', flush=True)
     project = work / 'project'; project.mkdir(); gen = project / 'Gen'; gen.mkdir()
