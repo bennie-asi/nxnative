@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 GIB = 2**30
+DOWNLOAD_ATTEMPTS = 12
 
 
 class InputError(Exception):
@@ -77,7 +78,7 @@ def verify_file(path, sha256=None):
 def download_file(entry, directory, index, opener=urlopen, pause=time.sleep):
     target = directory / entry['name']
     partial = target.with_name(target.name + '.part')
-    for attempt in range(1, 4):
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
             # Resume only with a checksum that verifies the complete input. A server that
             # ignores Range restarts the file; malformed partial responses never get appended.
@@ -120,11 +121,16 @@ def download_file(entry, directory, index, opener=urlopen, pause=time.sleep):
         except (OSError, URLError, HTTPException) as error:
             # Exception messages can contain signed URLs. Report only the HTTP status or error type.
             reason = f'HTTP {error.code}' if isinstance(error, HTTPError) else type(error).__name__
-            if attempt == 3:
+            if isinstance(error, HTTPError): error.close()
+            if attempt == DOWNLOAD_ATTEMPTS:
                 partial.unlink(missing_ok=True)
                 raise InputError(f'File {index}: download failed ({reason}); check URL access and expiry.') from None
-            print(f'File {index}: retrying download ({reason}, attempt {attempt}/3)', flush=True)
-            pause(attempt * 2)
+            # A tunnel or object-storage gateway may need tens of seconds to reconnect.
+            # Keep verified partial data through that outage instead of exhausting retries
+            # before the server recovers (a 12 GiB transfer hit HTTP 530 during recovery).
+            delay = min(5 * 2**(attempt - 1), 30)
+            print(f'File {index}: retrying download in {delay}s ({reason}, attempt {attempt}/{DOWNLOAD_ATTEMPTS})', flush=True)
+            pause(delay)
 
 
 def prepare_game(directory, files, keys):

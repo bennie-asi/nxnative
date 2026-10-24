@@ -125,6 +125,19 @@ class Files(unittest.TestCase):
             ci.download_file(entry, self.directory, 1, opener=opener, pause=mock.Mock())
         self.assertFalse(list(self.directory.iterdir()))
 
+    def test_gateway_outage_keeps_the_partial_file_until_recovery(self):
+        entry = {**ENTRY, 'sha256': hashlib.sha256(NSP).hexdigest()}
+        unavailable = HTTPError(ENTRY['url'], 530, 'Gateway temporarily disconnected', {}, None)
+        opener = mock.Mock(side_effect=[Response(NSP[:8], len(NSP)), unavailable, unavailable,
+            Response(NSP[8:], status=206, content_range=f'bytes 8-{len(NSP)-1}/{len(NSP)}')])
+        pause = mock.Mock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            ci.download_file(entry, self.directory, 1, opener=opener, pause=pause)
+        self.assertEqual((self.directory / ENTRY['name']).read_bytes(), NSP)
+        self.assertTrue(all(call.args[0].get_header('Range') == 'bytes=8-'
+                            for call in opener.call_args_list[1:]))
+        self.assertGreaterEqual(sum(call.args[0] for call in pause.call_args_list), 10)
+
     def test_network_errors_do_not_disclose_url(self):
         for error in (HTTPError(ENTRY['url'], 403, 'private-token', {}, None),
                       URLError(ENTRY['url']), IncompleteRead(b'partial')):
