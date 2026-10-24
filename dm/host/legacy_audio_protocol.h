@@ -27,4 +27,3 @@ _Static_assert(sizeof(ar_pool) == 0x20 && sizeof(ar_channel) == 0x70, "audren po
 _Static_assert(sizeof(ar_wave) == 0x38 && sizeof(ar_voice) == 0x170, "audren voice layout");
 _Static_assert(offsetof(ar_voice, wave) == 0x60 && offsetof(ar_voice, channel) == 0x140, "audren voice member offsets");
 _Static_assert(sizeof(ar_mix) == 0x930 && sizeof(ar_effect) == 0xc0 && sizeof(ar_sink) == 0x140, "audren mix/effect/sink layout");
-

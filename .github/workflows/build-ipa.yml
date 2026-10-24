@@ -110,6 +110,9 @@ jobs:
           fi
           xcrun --sdk iphoneos metal --version
           xcrun --sdk macosx metal --version
+          clang -fobjc-arc dm/tools/ci_metal_capabilities.m -framework Foundation -framework Metal \
+            -o "$RUNNER_TEMP/nxnative-metal-capabilities"
+          "$RUNNER_TEMP/nxnative-metal-capabilities"
           dotnet --version
           df -h "$RUNNER_TEMP"
 

@@ -10,6 +10,7 @@ import importlib.util
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 
@@ -32,6 +33,12 @@ def main():
     os.environ.update(DM_GAME=args.title.upper(), DM_GAMES_DIR=str(profile), DM_GAMES_FIRST='1')
     g = game.load()
     logs = work / 'logs'; logs.mkdir(parents=True, exist_ok=True)
+    capabilities = work / 'tools/metal-capabilities'; capabilities.parent.mkdir(exist_ok=True)
+    with (logs / 'metal_capabilities.log').open('w') as output:
+        subprocess.run(['clang', '-fobjc-arc', str(repo / 'dm/tools/ci_metal_capabilities.m'),
+                        '-framework', 'Foundation', '-framework', 'Metal', '-o', str(capabilities)],
+                       check=True, stdout=output, stderr=subprocess.STDOUT)
+        subprocess.run([str(capabilities)], check=True, stdout=output, stderr=subprocess.STDOUT)
     env = dict(os.environ, DM_ROOT=str(work), WORK=str(work / 'tmp'))
     if args.capture_audio: env['DM_AUDREN_LEGACY_CAPTURE'] = str(logs / 'audren_legacy_capture.json')
     (work / 'tmp').mkdir(exist_ok=True)
