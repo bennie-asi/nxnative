@@ -1,0 +1,83 @@
+name: Probe native SDK startup
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Base title ID of the prepared modules
+        type: string
+        required: true
+      package:
+        description: Prepared module version (v followed by its numeric version)
+        type: string
+        default: v0
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Prepare diagnostic inputs
+        env:
+          CI_PROBE_JSON: ${{ secrets.CI_PROBE_JSON }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        shell: bash
+        run: |
+          brew install gnupg
+          printf 'NX_PROBE_ROOT=%s\nGNUPGHOME=%s\n' \
+            "$RUNNER_TEMP/nxnative-probe" "$RUNNER_TEMP/nxnative-probe-gnupg" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/nxnative-probe" "$RUNNER_TEMP/nxnative-probe-gnupg"
+          chmod 700 "$RUNNER_TEMP/nxnative-probe-gnupg"
+          python dm/tools/ci_ipa_inputs.py download-probe --game-dir "$RUNNER_TEMP/nxnative-probe"
+          GNUPGHOME="$RUNNER_TEMP/nxnative-probe-gnupg" gpg --batch --yes \
+            --pinentry-mode loopback --passphrase-fd 0 --decrypt \
+            --output "$RUNNER_TEMP/nxnative-probe/bundle.tar.gz" \
+            "$RUNNER_TEMP/nxnative-probe/probe.tar.gz.gpg" <<< "$IPA_PASSWORD"
+          python - <<'PY'
+          import os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'nxnative-probe'
+          with tarfile.open(root / 'bundle.tar.gz') as archive:
+              archive.extractall(root, filter='data')
+          PY
+      - name: Probe prepared modules
+        continue-on-error: true
+        env:
+          PROBE_TITLE: ${{ inputs.title }}
+          PROBE_PACKAGE: ${{ inputs.package }}
+        run: python dm/tools/ci_native_probe.py --root "$NX_PROBE_ROOT" --title "$PROBE_TITLE" --package "$PROBE_PACKAGE"
+      - name: Encrypt diagnostic logs
+        if: ${{ always() }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        shell: bash
+        run: |
+          [[ -d "$NX_PROBE_ROOT" && -n "$IPA_PASSWORD" ]] || exit 0
+          python dm/tools/ci_ipa_inputs.py diagnostics --game-dir "$NX_PROBE_ROOT" \
+            --output "$NX_PROBE_ROOT/diagnostics.tar.gz"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_PROBE_ROOT/diagnostics.tar.gz.gpg" \
+            "$NX_PROBE_ROOT/diagnostics.tar.gz" <<< "$IPA_PASSWORD"
+      - name: Upload encrypted diagnostic logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-native-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NX_PROBE_ROOT }}/diagnostics.tar.gz.gpg
+          retention-days: 3
+          if-no-files-found: ignore

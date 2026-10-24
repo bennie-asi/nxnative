@@ -23,6 +23,19 @@ class InputError(Exception):
     pass
 
 
+def https_url(url):
+    try:
+        parsed = urlsplit(url) if isinstance(url, str) else None
+        return bool(parsed and parsed.scheme == 'https' and parsed.hostname
+                    and not parsed.username and not parsed.password
+                    and not any(c.isspace() for c in url))
+    except ValueError: return False
+
+
+def checksum_text(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-fA-F]{64}', value) is not None
+
+
 def load_inputs(env):
     for key in ('GAME_FILES_JSON', 'PROD_KEYS', 'IPA_PASSWORD'):
         if not env.get(key, '').strip():
@@ -47,19 +60,19 @@ def load_inputs(env):
         if name.casefold() in seen:
             raise InputError(f'File {i}: duplicate filename (case insensitive).')
         seen.add(name.casefold())
-        try:
-            parsed = urlsplit(url) if isinstance(url, str) else None
-            valid_url = (parsed and parsed.scheme == 'https' and parsed.hostname
-                         and not parsed.username and not parsed.password
-                         and not any(c.isspace() for c in url))
-        except ValueError:
-            valid_url = False
-        if not valid_url:
+        if not https_url(url):
             raise InputError(f'File {i}: url must be a direct HTTPS download URL.')
         sha = entry.get('sha256')
-        if sha is not None and (not isinstance(sha, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', sha)):
+        if sha is not None and not checksum_text(sha):
             raise InputError(f'File {i}: sha256 must contain 64 hexadecimal characters.')
     return files
+
+
+def verify_checksum(path, sha256):
+    with path.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if digest.lower() != sha256.lower():
+        raise InputError('Downloaded file does not match its sha256.')
 
 
 def verify_file(path, sha256=None):
@@ -69,13 +82,10 @@ def verify_file(path, sha256=None):
     if not valid:
         raise InputError('Downloaded content is not an NSP/XCI. Use a direct file URL, not a share page or ZIP.')
     if sha256 is not None:
-        with path.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        if digest.lower() != sha256.lower():
-            raise InputError('Downloaded file does not match its sha256.')
+        verify_checksum(path, sha256)
 
 
-def download_file(entry, directory, index, opener=urlopen, pause=time.sleep):
+def download_file(entry, directory, index, opener=urlopen, pause=time.sleep, verifier=verify_file):
     target = directory / entry['name']
     partial = target.with_name(target.name + '.part')
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
@@ -111,7 +121,7 @@ def download_file(entry, directory, index, opener=urlopen, pause=time.sleep):
                     if expected is not None and written != expected + offset:
                         raise OSError('Incomplete download')
             partial.replace(target)
-            verify_file(target, entry.get('sha256'))
+            verifier(target, entry.get('sha256'))
             print(f'File {index}: ready ({target.stat().st_size / GIB:.2f} GiB)', flush=True)
             return
         except InputError:
@@ -173,9 +183,19 @@ def collect_diagnostics(directory, output):
     print(f'Collected {len(files)} diagnostic file(s); archive must be encrypted before upload.')
 
 
+def probe_input(env):
+    try:
+        entry = json.loads(env.get('CI_PROBE_JSON', ''))
+        if (not isinstance(entry, dict) or not https_url(entry.get('url'))
+                or not checksum_text(entry.get('sha256'))): raise ValueError('invalid probe input')
+    except (ValueError, TypeError):
+        raise InputError('CI_PROBE_JSON must contain an HTTPS url and a sha256 checksum.') from None
+    return {'url': entry['url'], 'sha256': entry['sha256'], 'name': 'probe.tar.gz.gpg'}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('validate', 'download', 'check-encryption-space', 'diagnostics'))
+    parser.add_argument('command', choices=('validate', 'download', 'check-encryption-space', 'diagnostics', 'download-probe'))
     parser.add_argument('--game-dir', type=Path)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args(argv)
@@ -189,6 +209,9 @@ def main(argv=None):
             if args.command == 'download':
                 files = load_inputs(os.environ)
                 prepare_game(args.game_dir, files, os.environ['PROD_KEYS'])
+            elif args.command == 'download-probe':
+                args.game_dir.mkdir(parents=True, exist_ok=True)
+                download_file(probe_input(os.environ), args.game_dir, 1, verifier=verify_checksum)
             elif args.command == 'diagnostics':
                 if args.output is None: raise InputError('--output is required for diagnostics.')
                 collect_diagnostics(args.game_dir, args.output)

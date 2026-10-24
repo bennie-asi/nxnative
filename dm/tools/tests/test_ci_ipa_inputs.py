@@ -39,6 +39,14 @@ class Response(io.BytesIO):
 
 
 class Inputs(unittest.TestCase):
+    def test_probe_requires_https_and_checksum_without_game_keys(self):
+        value = {'url': ENTRY['url'], 'sha256': 'a' * 64, 'name': '../ignored'}
+        checked = ci.probe_input({'CI_PROBE_JSON': json.dumps(value)})
+        self.assertEqual(checked, {'url': ENTRY['url'], 'sha256': 'a' * 64, 'name': 'probe.tar.gz.gpg'})
+        for invalid in ({}, [], None, {**value, 'sha256': ''}, {**value, 'url': 'http://example.com'}):
+            with self.subTest(invalid=invalid), self.assertRaises(ci.InputError):
+                ci.probe_input({'CI_PROBE_JSON': json.dumps(invalid)})
+
     def test_manifest_and_optional_checksum(self):
         entry = {**ENTRY, 'sha256': hashlib.sha256(NSP).hexdigest()}
         self.assertEqual(ci.load_inputs(environment([entry])), [entry])
@@ -91,6 +99,13 @@ class Files(unittest.TestCase):
         self.assertEqual((self.directory / ENTRY['name']).read_bytes(), NSP)
         self.assertFalse(list(self.directory.glob('*.part')))
         self.assertEqual(opener.call_args.args[0].full_url, ENTRY['url'])
+
+    def test_encrypted_probe_blob_uses_checksum_verification(self):
+        blob = b'encrypted diagnostic input'
+        entry = {'name': 'probe.tar.gz.gpg', 'url': ENTRY['url'], 'sha256': hashlib.sha256(blob).hexdigest()}
+        with contextlib.redirect_stdout(io.StringIO()):
+            ci.download_file(entry, self.directory, 1, opener=mock.Mock(return_value=Response(blob)), verifier=ci.verify_checksum)
+        self.assertEqual((self.directory / entry['name']).read_bytes(), blob)
 
     def test_retries_partial_download(self):
         opener = mock.Mock(side_effect=[Response(NSP[:8], len(NSP)), Response(NSP)])
