@@ -123,6 +123,21 @@ def prepare(args):
     print('Prepared archives must be encrypted before upload.', flush=True)
 
 
+def shader_outputs(key, record, platform):
+    """All runtime libraries and the sources used to build the guard tables."""
+    names = [key + '_b.json']
+    # Geometry slice stubs deliberately carry no standalone library.
+    if not record.get('gs_slice'):
+        names.append(key + '_b.metallib')
+        if platform == 'mac': names.append(key + '_b.metal')
+    if record.get('vin'): names.append(key + '_bv.metallib')
+    if record.get('fetch'): names.append(key + '_bf.metallib')
+    if record.get('geometry'):
+        for suffix in [f'_bg{i}' for i in range(5)] + ['_bgv']:
+            names += [key + suffix + ext for ext in ('.json', '.metallib', '.metal') if platform == 'mac' or ext != '.metal']
+    return names
+
+
 def validate_shard(root, plan, index):
     shard = plan['shards'][index]; chain = plan['chain']; paths = {}
     results = json.loads((root / 'mac' / ('b-' + chain) / '_b_build.json').read_text())
@@ -135,13 +150,7 @@ def validate_shard(root, plan, index):
             reflection = directory / (key + '_b.json'); record = json.loads(reflection.read_text())
             if record.get('chain') != chain or record.get('dm_ctl') != key or record.get('route') != 'B':
                 raise BuildError('Shader reflection identity mismatch')
-            # Geometry slice stubs deliberately carry no standalone library.
-            names = [key + '_b.json']
-            if not record.get('gs_slice'): names.append(key + '_b.metallib')
-            if platform == 'mac' and not record.get('gs_slice'): names.append(key + '_b.metal')
-            if record.get('vin'): names.append(key + '_bv.metallib')
-            if record.get('fetch'): names.append(key + '_bf.metallib')
-            for name in names:
+            for name in shader_outputs(key, record, platform):
                 path = directory / name
                 if not path.is_file() or not path.stat().st_size: raise BuildError(f'Missing compiled output {name}')
                 paths[f'{platform}/b-{chain}/{name}'] = digest(path)
@@ -204,15 +213,18 @@ def merge_shards(assets, shards, output):
                 collected[relative] = checksum
         found[i] = manifest
     if set(found) != set(range(count)) or set(ownership) != set(plan['keys']): raise BuildError('Missing shader shards or keys')
-    # Re-check required files against reflection: a manifest cannot silently omit a base library.
+    # Re-check reflection dependencies even when an incomplete manifest hashes correctly.
     for key in plan['keys']:
         for platform in ('mac', 'ios'):
             directory = output / platform / ('b-' + plan['chain'])
             record = json.loads((directory / (key + '_b.json')).read_text())
-            if record.get('chain') != plan['chain'] or record.get('dm_ctl') != key: raise BuildError('Merged reflection identity mismatch')
-            if not record.get('gs_slice') and not (directory / (key + '_b.metallib')).is_file(): raise BuildError('Merged base library is missing')
-            for flag, suffix in (('vin', '_bv.metallib'), ('fetch', '_bf.metallib')):
-                if record.get(flag) and not (directory / (key + suffix)).is_file(): raise BuildError('Merged variant library is missing')
+            if record.get('chain') != plan['chain'] or record.get('dm_ctl') != key or record.get('route') != 'B':
+                raise BuildError('Merged reflection identity mismatch')
+            for name in shader_outputs(key, record, platform):
+                path = directory / name
+                relative = f'{platform}/b-{plan["chain"]}/{name}'
+                if relative not in collected or not path.is_file() or not path.stat().st_size:
+                    raise BuildError(f'Merged shader output is missing or empty: {relative}')
     return plan
 
 

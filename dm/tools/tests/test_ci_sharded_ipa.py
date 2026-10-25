@@ -78,14 +78,49 @@ class MergeTests(unittest.TestCase):
                 (shards[0] / 'shard.json').write_text(json.dumps(manifest))
                 with self.assertRaises(ci.BuildError): ci.merge_shards(assets, shards, root / 'out')
 
-    def test_a_manifest_cannot_omit_a_library_referenced_by_reflection(self):
+    def test_a_manifest_cannot_omit_guard_sources_or_reflection_dependencies(self):
+        for platform, suffix in (('ios', '_b.metallib'), ('mac', '_b.metal'),
+                                 ('ios', '_bv.metallib'), ('ios', '_bf.metallib'),
+                                 ('ios', '_bg4.metallib'), ('mac', '_bgv.metal')):
+            with self.subTest(platform=platform, suffix=suffix), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); assets, plan, shards = shader_fixture(root)
+                path = shards[0] / 'shard.json'; manifest = json.loads(path.read_text())
+                key = plan['shards'][0]['keys'][0]
+                for target in ('mac', 'ios'):
+                    folder = shards[0] / target / 'b-abcd1234'
+                    record = {'chain': plan['chain'], 'dm_ctl': key, 'route': 'B',
+                              'vin': True, 'fetch': True, 'geometry': {'vertices': 4}}
+                    for name in ci.shader_outputs(key, record, target):
+                        file = folder / name
+                        file.write_bytes(json.dumps(record).encode() if name.endswith('.json') else b'compiled')
+                        manifest['files'][f'{target}/b-abcd1234/{name}'] = ci.digest(file)
+                ci.validate_shard(shards[0], plan, 0)
+                omitted = f'{platform}/b-abcd1234/{key}{suffix}'
+                del manifest['files'][omitted]; path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ci.BuildError, 'shader output is missing'):
+                    ci.merge_shards(assets, shards, root / 'out')
+
+    def test_geometry_libraries_survive_merge_and_slice_stubs_need_no_library(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); assets, plan, shards = shader_fixture(root)
             path = shards[0] / 'shard.json'; manifest = json.loads(path.read_text())
-            omitted = next(p for p in manifest['files'] if p.startswith('ios/') and p.endswith('.metallib'))
-            del manifest['files'][omitted]; path.write_text(json.dumps(manifest))
-            with self.assertRaisesRegex(ci.BuildError, 'base library is missing'):
-                ci.merge_shards(assets, shards, root / 'out')
+            geometry, stub = plan['shards'][0]['keys']
+            for platform in ('mac', 'ios'):
+                folder = shards[0] / platform / 'b-abcd1234'
+                for key, extra in ((geometry, {'geometry': {'vertices': 4}}), (stub, {'gs_slice': {'layer': 1}})):
+                    record = {'chain': plan['chain'], 'dm_ctl': key, 'route': 'B', **extra}
+                    for name in ci.shader_outputs(key, record, platform):
+                        file = folder / name
+                        file.write_bytes(json.dumps(record).encode() if name.endswith('.json') else b'compiled')
+                    if key == stub:
+                        (folder / (key + '_b.metallib')).unlink()
+                        if platform == 'mac': (folder / (key + '_b.metal')).unlink()
+            manifest = ci.validate_shard(shards[0], plan, 0)
+            path.write_text(json.dumps(manifest))
+            ci.merge_shards(assets, shards, root / 'out')
+            self.assertTrue((root / f'out/ios/b-abcd1234/{geometry}_bg4.metallib').is_file())
+            self.assertTrue((root / f'out/mac/b-abcd1234/{geometry}_bgv.metal').is_file())
+            self.assertFalse((root / f'out/ios/b-abcd1234/{stub}_b.metallib').exists())
 
     def test_compiler_exit_success_does_not_hide_failed_shader_results(self):
         with tempfile.TemporaryDirectory() as temporary:
