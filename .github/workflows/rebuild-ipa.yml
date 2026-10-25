@@ -162,10 +162,7 @@ jobs:
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
         run: |
           mkdir -p "$NX_REBUILD_ROOT/output"
-          python dm/tools/ci_ipa_inputs.py check-encryption-space --game-dir "$NX_REBUILD_ROOT/build"
-          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
-            --output "$NX_REBUILD_ROOT/output/game.ipa.gpg" "$NX_REBUILD_ROOT/build/game.ipa" <<< "$IPA_PASSWORD"
-          (cd "$NX_REBUILD_ROOT/output" && shasum -a 256 game.ipa.gpg > SHA256SUMS.txt)
+          python dm/tools/ci_encrypt_ipa.py --source "$NX_REBUILD_ROOT/build/game.ipa" --output "$NX_REBUILD_ROOT/output/game.ipa.gpg"
       - name: Upload encrypted IPA
         if: ${{ !inputs.check_only }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

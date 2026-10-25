@@ -181,14 +181,10 @@ jobs:
         env:
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
         run: |
-          python dm/tools/ci_ipa_inputs.py check-encryption-space --game-dir "$NX_GAME_DIR"
           mkdir -p "$NX_OUTPUT_DIR" "$GNUPGHOME"
           chmod 700 "$GNUPGHOME"
-          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
-            --symmetric --cipher-algo AES256 --compress-algo none \
-            --output "$NX_OUTPUT_DIR/game.ipa.gpg" "$NX_GAME_DIR/game.ipa" <<< "$IPA_PASSWORD"
+          python dm/tools/ci_encrypt_ipa.py --source "$NX_GAME_DIR/game.ipa" --output "$NX_OUTPUT_DIR/game.ipa.gpg"
           rm -f -- "$NX_GAME_DIR/game.ipa"
-          (cd "$NX_OUTPUT_DIR" && shasum -a 256 game.ipa.gpg > SHA256SUMS.txt)
 
       - name: Upload encrypted IPA
         id: upload

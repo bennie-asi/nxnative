@@ -72,6 +72,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/nxnative-sharded" "$RUNNER_TEMP/nxnative-sharded-gpg"
           chmod 700 "$RUNNER_TEMP/nxnative-sharded-gpg"
           bash dm/tools/ci_mac_dependencies.sh prepare
+      - name: Check encrypted artifact round trips and failure handling
+        run: python -m unittest discover -s dm/tools/tests -p 'test_ci_encrypt_ipa.py'
       - name: Verify the translator and available compilers before downloading game data
         run: |
           python - <<'PY'
@@ -284,29 +286,59 @@ jobs:
         run: |
           gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
             --output "$NX_ROOT/assets.tar.gz" "$NX_ROOT/download/assets/runtime-assets.tar.gz.gpg" <<< "$IPA_PASSWORD"
-          for directory in "$NX_ROOT"/download/shards/*; do
-            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
-              --output "$directory/shard.tar.gz" "$directory/shard.tar.gz.gpg" <<< "$IPA_PASSWORD"
-          done
           python - <<'PY'
           import os, tarfile
           from pathlib import Path
           root = Path(os.environ['NX_ROOT'])
           with tarfile.open(root / 'assets.tar.gz') as archive: archive.extractall(root / 'assets', filter='data')
-          for path in (root / 'download/shards').glob('*/shard.tar.gz'):
-              with tarfile.open(path) as archive: archive.extractall(root / 'shards' / path.parent.name, filter='data')
+          (root / 'assets.tar.gz').unlink()
+          (root / 'download/assets/runtime-assets.tar.gz.gpg').unlink()
           PY
+          for directory in "$NX_ROOT"/download/shards/*; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
+              --output "$directory/shard.tar.gz" "$directory/shard.tar.gz.gpg" <<< "$IPA_PASSWORD"
+            python - "$directory/shard.tar.gz" <<'PY'
+          import os, sys, tarfile
+          from pathlib import Path
+          root = Path(os.environ['NX_ROOT']); path = Path(sys.argv[1])
+          with tarfile.open(path) as archive: archive.extractall(root / 'shards' / path.parent.name, filter='data')
+          path.unlink()
+          path.with_suffix(path.suffix + '.gpg').unlink()
+          PY
+          done
+          df -h "$NX_ROOT"
       - name: Verify full coverage and build the unsigned IPA
         run: python dm/tools/ci_sharded_ipa.py assemble --root "$NX_ROOT/assets" --shards "$NX_ROOT/shards" --output "$NX_ROOT/build"
+      - name: Save diagnostics before encrypting the large IPA
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import json, os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['NX_ROOT']); assets = root / 'assets'
+          title = json.loads((assets / 'plan.json').read_text())['title']
+          with tarfile.open(root / 'before-encryption.tar.gz', 'w:gz') as archive:
+              archive.add(root / 'build/logs', arcname=f'{title}_build/logs')
+              archive.add(assets / 'profile' / title / 'game.tsv', arcname=f'{title}_build/profile/{title}/game.tsv')
+          PY
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_ROOT/before-encryption.tar.gz.gpg" "$NX_ROOT/before-encryption.tar.gz" <<< "$IPA_PASSWORD"
+      - name: Upload the pre-encryption diagnostic checkpoint
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-before-encryption-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NX_ROOT }}/before-encryption.tar.gz.gpg
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
       - name: Encrypt the unsigned IPA
         env:
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
         run: |
           mkdir -p "$NX_ROOT/output"
-          python dm/tools/ci_ipa_inputs.py check-encryption-space --game-dir "$NX_ROOT/build"
-          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
-            --output "$NX_ROOT/output/game.ipa.gpg" "$NX_ROOT/build/game.ipa" <<< "$IPA_PASSWORD"
-          (cd "$NX_ROOT/output" && shasum -a 256 game.ipa.gpg > SHA256SUMS.txt)
+          python dm/tools/ci_encrypt_ipa.py --source "$NX_ROOT/build/game.ipa" \
+            --output "$NX_ROOT/output/game.ipa.gpg" --log "$NX_ROOT/build/logs/encryption.jsonl"
       - name: Upload encrypted IPA
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
