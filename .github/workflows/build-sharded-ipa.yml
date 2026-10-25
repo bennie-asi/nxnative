@@ -52,17 +52,26 @@ jobs:
           python -m unittest discover -s dm/tools/tests -p 'test_nsp_*.py'
           make -C dm/host/tests GAME=010015100B514000 sf dsp
       - name: Set up .NET
-        if: ${{ !inputs.check_only }}
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: "10.0.x"
       - name: Prepare temporary paths and tools
-        if: ${{ !inputs.check_only }}
         run: |
           printf 'NX_ROOT=%s\nGNUPGHOME=%s\n' "$RUNNER_TEMP/nxnative-sharded" "$RUNNER_TEMP/nxnative-sharded-gpg" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/nxnative-sharded" "$RUNNER_TEMP/nxnative-sharded-gpg"
           chmod 700 "$RUNNER_TEMP/nxnative-sharded-gpg"
           bash dm/tools/ci_mac_dependencies.sh prepare
+      - name: Verify the locked shader toolchain before downloading game data
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, 'dm/gfx/tools')
+          import dmsh_chain
+          errors = dmsh_chain.check_tools()
+          if errors:
+              raise SystemExit('\n'.join('[RED] ' + error for error in errors))
+          print('Verified the locked translator, SPIRV-Cross and macOS/iOS Metal compilers.')
+          PY
       - name: Download and stage the game once
         if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
         env:

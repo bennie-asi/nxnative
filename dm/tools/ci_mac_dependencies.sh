@@ -17,9 +17,6 @@ case "${1:-}" in
     ;;
   compile)
     brew install spirv-cross gnupg
-    if ! xcrun --sdk iphoneos metal --version; then xcodebuild -downloadComponent MetalToolchain; fi
-    xcrun --sdk iphoneos metal --version
-    xcrun --sdk macosx metal --version
     ;;
   assemble)
     brew install xcodegen gnupg
@@ -27,5 +24,10 @@ case "${1:-}" in
     ;;
   *) echo '[RED] Expected prepare, compile or assemble.'; exit 1 ;;
 esac
+if [[ "$1" == prepare || "$1" == compile ]]; then
+  if ! xcrun --sdk iphoneos metal --version; then xcodebuild -downloadComponent MetalToolchain; fi
+  xcrun --sdk iphoneos metal --version
+  xcrun --sdk macosx metal --version
+fi
 xcodebuild -version
 df -h "$RUNNER_TEMP"
