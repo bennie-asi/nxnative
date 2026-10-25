@@ -30,6 +30,22 @@ def is_call(w): return (w & 0xfc000000) == 0x94000000 or (w & 0xfffffc1f) == 0xd
 def is_str_x0(w, base): return (w & 0xffc003ff) == 0xf9000000 | (base << 5) and ((w >> 10) & 0xfff) == 0   # str x0, [base]
 def str_x0(w): return ((w >> 5) & 31, ((w >> 10) & 0xfff) * 8) if (w & 0xffc0001f) == 0xf9000000 else None   # str x0, [base, #off] → (base, off)
 
+def result_slot(words, i, page):
+    """Where a get-proc call stores x0, allowing the next name's address setup."""
+    r = adrp(words[i + 1], (i + 1) * 4); l = ldr64(words[i + 2])
+    s = str_x0(words[i + 1]); s2 = str_x0(words[i + 2])
+    if r and l and l[1] == r[0] and 0 not in (r[0], l[0]):
+        # Older NVN loaders hoist the next name's adrp / add before this store
+        # (Revelations main+0xac070c). Neither x0 nor the pointer may be changed.
+        for j in range(i + 3, min(i + 8, len(words))):
+            if is_str_x0(words[j], l[0]): return r[1] + l[2]
+            address = adrp(words[j], j * 4) or addimm(words[j])
+            if not address or address[0] in (0, l[0]): break
+    if r and r[0] != 0 and s2 and s2[0] == r[0]: return r[1] + s2[1]   # straight into a global (LÖVE's glad)
+    if s and s[0] in page and s[0] not in (0, 1): return page[s[0]] + s[1]
+    return None
+
+
 def got_values(img):
     """{address: the address it holds once relocated} for the image's relative relocations (RELA R_AARCH64_RELATIVE, and RELR, whose addend is in place)"""
     out = {}
@@ -129,11 +145,8 @@ def main():
             r = adrp(words[k], k * 4); s = addimm(words[k + 1])
             if r and s and r[0] in (0, 1) and s[1] == r[0] and s[0] == r[0]: name = cstr(r[1] + s[2])
         if not name: continue
-        r = adrp(words[i + 1], (i + 1) * 4); l = ldr64(words[i + 2]); s = str_x0(words[i + 1]); s2 = str_x0(words[i + 2])
-        if r and l and l[1] == r[0] and is_str_x0(words[i + 3], l[0]): at = r[1] + l[2]   # through the GOT: adrp + ldr of the slot's address, str x0 to it (Digimon)
-        elif r and s2 and s2[0] == r[0]: at = r[1] + s2[1]   # straight into the global: adrp + str x0, [page, #off] (LÖVE's glad: Balatro)
-        elif s and s[0] in page and s[0] not in (0, 1): at = page[s[0]] + s[1]   # str x0, [base, #off], base a page set earlier
-        else: continue
+        at = result_slot(words, i, page)
+        if at is None: continue
         if name not in slot.setdefault(at, []): slot[at].append(name)   # a slot two names were stored into keeps both
         loader.update(range((i - 4) * 4, (i + 4) * 4, 4))
     slot = {at: ' / '.join(sorted(names, key=len)) for at, names in slot.items()}
