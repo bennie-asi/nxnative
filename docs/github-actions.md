@@ -87,6 +87,14 @@ Get-FileHash -Algorithm SHA256 -LiteralPath .\game.ipa.gpg
 
 Sign and install `game.ipa` using your Windows sideloading tool, such as [Sideloadly](https://sideloadly.io/). The IPA is unsigned; downloading it alone does not install it. Where supported by your signing setup, preserve the **Increased Memory Limit** entitlement for larger games (see the [README](../README.md#pack-an-ipa)). The workflow does not test the game on an iPhone.
 
+### First iPhone test with Sideloadly on Windows
+
+1. Install [Sideloadly](https://sideloadly.io/) and follow its current Windows prerequisite instructions for Apple's device drivers. Connect the unlocked iPhone by USB and accept **Trust This Computer** when prompted.
+2. Drag the decrypted `.ipa` into Sideloadly, select the iPhone and use your Apple ID to sign and install it. Complete authentication in Sideloadly. Apple credentials belong in the signing tool; the GitHub workflow does not use them.
+3. If iOS requests it, enable **Settings > Privacy & Security > Developer Mode**, restart and confirm. Trust the developer under **Settings > General > VPN & Device Management** when prompted. See [Sideloadly's setup and troubleshooting guide](https://sideloadly.io/faq).
+4. Open the game, tap **Play** in its launcher, and test the title screen and an actual gameplay scene. Check the picture, sound, touch controls or controller, and whether it stays open for several minutes. Report the iPhone model, exact iOS version and where a failure occurs. A successful installation or visible launcher does not verify the game itself.
+5. In the iPhone **Files** app, open **Browse > On My iPhone > the game's app folder** and export `log.txt`; the previous launch is `log.prev.txt`. These are the app's `Documents` files. Preserve the log immediately after a failure. If installation itself fails, provide Sideloadly's installation error instead. Save data is in `save/`; keep a copy before replacing or removing a test build.
+
 ## Large shader sets: compile in separate jobs
 
 **Build IPA in shader shards** uses standard `macos-26` runners to split the NVN shader set into eight jobs, then verifies and assembles all outputs into one unsigned IPA. This is useful when the full shader build exceeds the six-hour limit of a single hosted job. It uses the same `GAME_FILES_JSON`, `PROD_KEYS` and `IPA_PASSWORD` secrets as the normal workflow. It does not require a local Mac.
