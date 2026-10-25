@@ -138,8 +138,8 @@ static const int g_devinfo[] = {
     [0x2B] = 262144, [0x2C] = 15, [0x2D] = 2048, [0x2E] = 1, [0x2F] = 1, [0x30] = 14, [0x31] = 5, [0x32] = 1, [0x33] = 8,
     [0x34] = 8, [0x35] = 4, [0x36] = 32, [0x37] = 128, [0x38] = 32, [0x39] = 128, [0x3A] = 65536, [0x3B] = 1, [0x3C] = 4,
     [0x3D] = 16384, [0x3E] = 134217728, [0x3F] = 2048, [0x40] = 16384, [0x41] = 16384, [0x42] = 1, [0x43] = 1, [0x44] = 1,
-    // SUPPORTS_DRAW_TEXTURE must stay false until DrawTexture is implemented:
-    // advertising the optional path sends engines to the unimplemented stub.
+    // Keep the optional path unadvertised during device validation of its 2D
+    // color implementation; direct calls are handled by DrawTexture below.
     [0x45] = 1, [0x46] = 5, [0x47] = 0, [0x48] = 1, [0x49] = 1, [0x4A] = 1, [0x4B] = 1, [0x4C] = 1, [0x4D] = 16,
     [0x4E] = 1024, [0x4F] = 32, [0x50] = 4096, [0x51] = 65536, [0x52] = 65536, [0x53] = 256, [0x54] = 16384,
     [0x55] = 262144, [0x56] = 4096, [0x57] = 1, [0x58] = 4, [0x59] = 2, [0x5A] = 0, [0x5B] = 4096, [0x5C] = 16384,
@@ -1020,6 +1020,16 @@ NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNte
     p_copy_t2t *o = REC_SNAP(c, OP_COPY_T2T, p_copy_t2t, 2); o->src = tex_snap(o, SNAP_OFF(p_copy_t2t), 0, s, (uint64_t)__builtin_return_address(0)); o->dst = tex_snap(o, SNAP_OFF(p_copy_t2t), 1, d, (uint64_t)__builtin_return_address(0));
     copy_view(&o->sv, &o->has_sv, sv); copy_view(&o->dv, &o->has_dv, dv); o->sr = *sr; o->dr = *dr; o->flags = flags;
 }
+NVN(nvnCommandBufferDrawTexture, void, NVNcommandBuffer *c, NVNtextureHandle handle, const NVNdrawTextureRegion *dst, const NVNdrawTextureRegion *src) {
+    if (!dst || !src) { LOG("[RED] DrawTexture: missing rectangle"); return; }
+    float d[4], s[4]; memcpy(d, dst, sizeof d); memcpy(s, src, sizeof s);
+    nvn_draw_texture_map map; int ready = nvn_dt_prepare(&map, d, s);
+    if (ready < 0) { LOG("[RED] DrawTexture: non-finite rectangle"); return; }
+    if (!ready) return;
+    p_draw_tex *record = REC(c, OP_DRAW_TEX, p_draw_tex); record->handle = handle; record->map = map;
+    mtl_note_draw_texture();
+}
+_Static_assert(sizeof(NVNdrawTextureRegion) == 16, "DrawTexture regions hold four floats");
 NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { p_copy_stride *o = REC(c, OP_COPY_STRIDE, p_copy_stride); o->stride = st; o->image = 0; }
 NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) { p_copy_stride *o = REC(c, OP_COPY_STRIDE, p_copy_stride); o->stride = st; o->image = 1; }   // Link's Awakening
 NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }

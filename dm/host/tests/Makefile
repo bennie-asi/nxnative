@@ -41,6 +41,12 @@ $(B)/t_audren_dsp: t_audren_dsp.c ../hle_audren_dsp.c ../legacy_audio_dsp.h ../l
 dsp: $(B)/t_audren_dsp
 	$(B)/t_audren_dsp
 run: dsp
+$(B)/t_draw_texture: t_draw_texture.c ../../gfx/nvn/nvn_draw_texture.h | $(B)
+	clang -O1 -g -Wall -Werror -o $@ t_draw_texture.c -lm
+.PHONY: draw_texture
+draw_texture: $(B)/t_draw_texture
+	$(B)/t_draw_texture
+run: draw_texture
 $(B)/t_nro: t_nro.c ../loader.c ../hle_ro.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	clang -O1 -g -Wall -Wno-unused-function -Wno-deprecated-declarations -I.. $(GINC) -o $@ t_nro.c
 .PHONY: nro

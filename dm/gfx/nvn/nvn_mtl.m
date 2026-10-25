@@ -20,6 +20,7 @@
 #include "../tex/nvn_deswizzle.h"
 #include "../tex/nvn_deswizzle_gpu.h"
 #include "nvn_builtin.h"
+#include "nvn_draw_texture_msl.h"
 #include "nvn_dirty.h"
 #include "nvn_refl.h"
 #include "nvn_cover.h"
@@ -646,8 +647,15 @@ static void *g_sub_pool;
 static int tbdr_on(void);
 
 static uint64_t g_sub_serial;   // Submission index (used by the parallel precompile's 'predict only once per submission')
+static _Atomic int g_draw_tex_recorded, g_draw_tex_conservative;
+void mtl_note_draw_texture(void) { atomic_store_explicit(&g_draw_tex_recorded, 1, memory_order_relaxed); }
 void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
+    // The dependency optimizers inspect game shader reflection. A fixed-function
+    // texture draw has no such program, so keep its submissions conservative.
+    if (atomic_load_explicit(&g_draw_tex_recorded, memory_order_relaxed) &&
+        !atomic_exchange_explicit(&g_draw_tex_conservative, 1, memory_order_relaxed))
+        MLOG("DrawTexture: conservative render-pass dependencies enabled");
     defer_drain();
     defer_reset();
     warm_claim();
@@ -1294,7 +1302,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); mtl_init
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[111];
+static int g_red_once[114];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2378,7 +2386,7 @@ static int udc_on(void) {
 // Only for equivalence comparison (the same replay run on / off, comparing the picture byte by byte), not a product configuration
 // Mario: off by default (only DM_NVN_TBDR=1 turns it on). These optimizations infer read / write relations from "which textures are bound in texture slots", while 38% of this game's shaders use bindless textures (handles in uniform buffers, NVN_RB_TEXU),
 //   so the inference would miss readers - e.g. deciding an attachment is never read afterwards and not storing it. Turn them back on once they recognize bindless readers.
-static int tbdr_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TBDR"); v = e && !strcmp(e, "1"); if (!v) MLOG("TBDR optimizations off by default (this game uses bindless textures; DM_NVN_TBDR=1 turns them on)"); } return v; }
+static int tbdr_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TBDR"); v = e && !strcmp(e, "1"); if (!v) MLOG("TBDR optimizations off by default (this game uses bindless textures; DM_NVN_TBDR=1 turns them on)"); } return v && !atomic_load_explicit(&g_draw_tex_conservative, memory_order_relaxed); }
 static int rt_range_on(void) { static int v = -1; if (v < 0) { const char *e=getenv("DM_NVN_RT_RANGE"); v=e && !strcmp(e,"1"); } return v; }   // Narrow candidate, off by default
 static uint64_t g_sd_dead_bytes, g_sd_n_dead, g_sd_n_all;
 // ---------- Cross-submission attachment validity ledger ----------
@@ -6791,6 +6799,20 @@ static int lc_keeps(uint32_t op) {
     }
 }
 
+static void vis_count_draw(id<MTL4RenderCommandEncoder> en) {
+    if (g_vis_counting) {
+        if (!g_enc_has_vis) RED_ONCE(34, "occlusion query counting began in a pass without a visibility buffer (the first reset happened mid-pass); that pass's samples are not counted");
+        else {
+            if (g_vis_cur < 0 || g_vis_cur_pass != g_pass.serial) {
+                if (g_vis_n >= VIS_SLOTS) RED_ONCE(35, "visibility slots exhausted");
+                else { g_vis_cur = (int)g_vis_n++; g_vis_cur_pass = g_pass.serial;
+                    if (g_nvs == g_vscap) { g_vscap = g_vscap ? g_vscap * 2 : 64; g_vs = realloc(g_vs, g_vscap * sizeof *g_vs); }
+                    g_vs[g_nvs++] = (vis_slot){(void *)CFBridgingRetain(g_vis), (uint32_t)g_vis_cur}; }
+            }
+            if (g_vis_cur >= 0 && g_enc_vis != g_vis_cur + 1) { enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_vis_cur * 8); g_enc_vis = g_vis_cur + 1; }
+        }
+    }
+}
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
     if (!g_geo_program && S.prog) {
@@ -6937,18 +6959,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
                                                     pr->sh[3] ? pr->sh[3]->key : "-", pr->sh[4] ? pr->sh[4]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-"); }
             PD("Z %llu draw skipped: primitive type %d", g_stat_pass, prim); return;
     }
-    if (g_vis_counting) {   // Occlusion query counting: a new slot for this render pass (also switch to a new slot after a report / reset)
-        if (!g_enc_has_vis) RED_ONCE(34, "occlusion query counting began in a pass without a visibility buffer (the first reset happened mid-pass); that pass's samples are not counted");
-        else {
-            if (g_vis_cur < 0 || g_vis_cur_pass != g_pass.serial) {
-                if (g_vis_n >= VIS_SLOTS) RED_ONCE(35, "visibility slots exhausted");
-                else { g_vis_cur = (int)g_vis_n++; g_vis_cur_pass = g_pass.serial;
-                    if (g_nvs == g_vscap) { g_vscap = g_vscap ? g_vscap * 2 : 64; g_vs = realloc(g_vs, g_vscap * sizeof *g_vs); }
-                    g_vs[g_nvs++] = (vis_slot){(void *)CFBridgingRetain(g_vis), (uint32_t)g_vis_cur}; }
-            }
-            if (g_vis_cur >= 0 && g_enc_vis != g_vis_cur + 1) { enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_vis_cur * 8); g_enc_vis = g_vis_cur + 1; }
-        }
-    }
+    vis_count_draw(en);
     g_stat_draw++;
     if (enc_label_on() && !g_el_draws++ && pr->sh[1]) { memcpy(g_el_key, pr->sh[1]->key, 8); g_el_key[8] = 0; }
     if (passdump()) {   // Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
@@ -7657,6 +7668,84 @@ static void clear_ds_tri(const p_clear_ds *c) {
        (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height);
 }
 
+static void draw_texture(const p_draw_tex *c) {
+    static int failed; if (failed) return;
+    if (!R.has_rt || R.rt.n < 1 || !R.rt.color[0]) return;
+    rp_flush(); rp_end();   // land pending clears and any source writes before sampling
+    uint64_t h = c->handle;
+    int tid = (int)(h & 0xfffff), sid = (int)(h >> 20);
+    if (tid) tid += S.tex_base; if (sid) sid += S.samp_base;
+    pthread_mutex_lock(&g_rmu);
+    id<MTLTexture> texture = tex_by_id(tid);
+    id<MTLSamplerState> sampler = samp_by_id(sid);
+    float bias = sampler ? g_sreg[sid].lod_bias : 0;
+    int compare = sampler ? g_sreg[sid].cmp_mode : 0;
+    pthread_mutex_unlock(&g_rmu);
+    if (!texture || !sampler) return;
+    if (texture.textureType != MTLTextureType2D || texture.sampleCount != 1 || fmt_int_or_ds(texture.pixelFormat) || compare) {
+        RED_ONCE(112, "DrawTexture source is unsupported (type %lu format %lu samples %lu compare %d)", (unsigned long)texture.textureType, (unsigned long)texture.pixelFormat, (unsigned long)texture.sampleCount, compare); return;
+    }
+    id<MTL4RenderCommandEncoder> en = rp_begin();
+    if (!en || !g_pass.cfmt[0]) return;
+    if (fmt_int_or_ds((MTLPixelFormat)g_pass.cfmt[0])) { RED_ONCE(112, "DrawTexture needs a floating-point or normalized color target"); return; }
+    MTLScissorRect sc; if (!clr_scissor(&sc)) return;
+    static id<MTLFunction> vertex, fragment; static id<MTL4ArgumentTable> vt, ft;
+    static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *cache;
+    if (!cache) {
+        NSError *error = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_nvn_draw_texture_msl) options:nil error:&error];
+        vertex = [lib newFunctionWithName:@"draw_texture_vs"]; fragment = [lib newFunctionWithName:@"draw_texture_fs"];
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1;
+        vt = rec_table([g_dev newArgumentTableWithDescriptor:ad error:&error]);
+        ad.maxTextureBindCount = 1; ad.maxSamplerStateBindCount = 1;
+        ft = rec_table([g_dev newArgumentTableWithDescriptor:ad error:&error]);
+        if (!vertex || !fragment || !vt || !ft) { failed = 1; RED_ONCE(111, "cannot initialize DrawTexture shaders/arguments: %s", error.localizedDescription.UTF8String); return; }
+        cache = [NSMutableDictionary dictionary];
+    }
+    struct { uint32_t cfmt[8], dfmt, sfmt, samples, mask, blend_en, a2c; blend_st blend; } key;
+    memset(&key, 0, sizeof key); memcpy(key.cfmt, g_pass.cfmt, sizeof key.cfmt);
+    key.dfmt = g_pass.dfmt; key.sfmt = g_pass.sfmt; key.samples = g_pass.samples;
+    key.mask = S.chmask.mask & 0xf; key.blend_en = S.color.blend_en & 1; key.blend = S.blend[0]; key.a2c = S.ms.a2c;
+    if (!key.mask) return;
+    NSData *kd = [NSData dataWithBytes:&key length:sizeof key]; id<MTLRenderPipelineState> pipeline = cache[kd];
+    if (!pipeline) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vertex; pd.fragmentFunction = fragment;
+        pd.depthAttachmentPixelFormat = (MTLPixelFormat)key.dfmt; pd.stencilAttachmentPixelFormat = (MTLPixelFormat)key.sfmt;
+        pd.rasterSampleCount = key.samples ? key.samples : 1; pd.alphaToCoverageEnabled = key.a2c != 0;
+        for (int i = 0; i < 8; i++) if (key.cfmt[i]) { pd.colorAttachments[i].pixelFormat = (MTLPixelFormat)key.cfmt[i]; pd.colorAttachments[i].writeMask = MTLColorWriteMaskNone; }
+        MTLRenderPipelineColorAttachmentDescriptor *color = pd.colorAttachments[0];
+        color.writeMask = (key.mask & 1 ? MTLColorWriteMaskRed : 0) | (key.mask & 2 ? MTLColorWriteMaskGreen : 0) | (key.mask & 4 ? MTLColorWriteMaskBlue : 0) | (key.mask & 8 ? MTLColorWriteMaskAlpha : 0);
+        if (key.blend_en) {
+            color.blendingEnabled = YES;
+            color.sourceRGBBlendFactor = bfac(key.blend.src_rgb); color.destinationRGBBlendFactor = bfac(key.blend.dst_rgb);
+            color.sourceAlphaBlendFactor = bfac(key.blend.src_a); color.destinationAlphaBlendFactor = bfac(key.blend.dst_a);
+            color.rgbBlendOperation = bop(key.blend.eq_rgb); color.alphaBlendOperation = bop(key.blend.eq_a);
+        }
+        NSError *error = nil; pipeline = [g_dev newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!pipeline) { RED_ONCE(113, "cannot create DrawTexture pipeline: %s", error.localizedDescription.UTF8String); return; }
+        cache[kd] = pipeline;
+    }
+    id<MTLBuffer> buffer; size_t offset = arena_alloc(64, &buffer); float params[16] = {0};
+    for (int i = 0; i < 4; i++) params[i] = c->map.dst[i] / 4096.f;
+    for (int i = 0; i < 2; i++) { params[4 + i] = c->map.src[i] / 4096.f; params[6 + i] = (float)(c->map.step[i] / 4294967296.0); }
+    params[8] = 1.f / g_pass.tw; params[9] = 1.f / g_pass.th;
+    params[10] = 1.f / texture.width; params[11] = 1.f / texture.height; params[12] = bias;
+    memcpy((uint8_t *)buffer.contents + offset, params, sizeof params);
+    [vt setAddress:buffer.gpuAddress + offset atIndex:0]; [ft setAddress:buffer.gpuAddress + offset atIndex:0];
+    [ft setTexture:texture.gpuResourceID atIndex:0]; [ft setSamplerState:sampler.gpuResourceID atIndex:0];
+    [en setArgumentTable:vt atStages:MTLRenderStageVertex]; [en setArgumentTable:ft atStages:MTLRenderStageFragment];
+    enc_r_pso(en, pipeline); g_enc_pso = nil;
+    // NVN's command writer disables depth/stencil/depth-bounds for this blit.
+    enc_r_dss(en, clr_dss(0, 0)); g_enc_dss = nil;
+    enc_r_viewport(en, (MTLViewport){0, 0, (double)g_pass.tw, (double)g_pass.th, 0, 1}); enc_r_scissor(en, sc);
+    enc_r_cull(en, MTLCullModeNone); enc_r_fill(en, MTLTriangleFillModeFill); enc_r_depth_bias(en, 0, 0, 0); enc_r_depth_clip(en, YES);
+    enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]); g_ed.ok = 0;
+    vis_count_draw(en); enc_r_draw(en, MTLPrimitiveTypeTriangleStrip, 0, 4); g_stat_draw++; clr_note(0, 0, 0);
+    if (g_vt) [en setArgumentTable:g_vt atStages:MTLRenderStageVertex];
+    if (g_ft) [en setArgumentTable:g_ft atStages:MTLRenderStageFragment];
+    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    static int first; if (!first++) MLOG("DrawTexture: first rectangle dst=%g,%g %gx%g source texture %d sampler %d", params[0], params[1], params[2], params[3], tid, sid);
+}
+
 void mtl_exec(const uint8_t *p) {
     static int inited; if (!inited) { inited = 1; state_reset(); }
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
@@ -7769,6 +7858,7 @@ void mtl_exec(const uint8_t *p) {
             }
             case OP_DRAW: { if (g_rc_skip) break; p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
             case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
+            case OP_DRAW_TEX: if (!g_rc_skip) draw_texture(a); break;
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
             case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:

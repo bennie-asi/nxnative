@@ -51,7 +51,7 @@ jobs:
           python -m unittest discover -s dm/tools/tests -p 'test_loader_census.py'
           python -m unittest discover -s dm/tools/tests -p 'test_own_compilers.py'
           python -m unittest discover -s dm/tools/tests -p 'test_nsp_*.py'
-          make -C dm/host/tests GAME=010015100B514000 sf dsp
+          make -C dm/host/tests GAME=010015100B514000 sf dsp draw_texture
       - name: Set up .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
@@ -73,6 +73,19 @@ jobs:
               raise SystemExit('\n'.join('[RED] ' + error for error in errors))
           print('Verified the locked translator and available SPIRV-Cross/macOS/iOS Metal compilers.')
           PY
+      - name: Compile the host and fixed-function shaders
+        if: inputs.check_only
+        run: |
+          python - <<'PY'
+          import ast, os, re
+          from pathlib import Path
+          source = Path('dm/gfx/nvn/nvn_draw_texture_msl.h').read_text()
+          strings = re.findall(r'^\s*("(?:[^"\\]|\\.)*")', source, re.M)
+          Path(os.environ['RUNNER_TEMP'], 'draw_texture.metal').write_text(''.join(map(ast.literal_eval, strings)))
+          PY
+          xcrun -sdk macosx metal -c "$RUNNER_TEMP/draw_texture.metal" -o "$RUNNER_TEMP/draw_texture-mac.air"
+          xcrun -sdk iphoneos metal -c -mios-version-min=18.0 "$RUNNER_TEMP/draw_texture.metal" -o "$RUNNER_TEMP/draw_texture-ios.air"
+          make -C dm/host GAME=010015100B514000
       - name: Download and stage the game once
         if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
         env:
