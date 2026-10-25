@@ -15,6 +15,10 @@ on:
         description: Optional previous sharded run whose encrypted prepared inputs still exist
         type: string
         default: ""
+      assemble_run:
+        description: Optional run with all compiled shards; skip compilation and assemble them with this source
+        type: string
+        default: ""
       check_only:
         description: Run data-free checks without preparing or compiling a game
         type: boolean
@@ -37,6 +41,7 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       source_run: ${{ steps.plan.outputs.source_run }}
+      shader_run: ${{ steps.plan.outputs.shader_run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,6 +57,11 @@ jobs:
           python -m unittest discover -s dm/tools/tests -p 'test_own_compilers.py'
           python -m unittest discover -s dm/tools/tests -p 'test_nsp_*.py'
           make -C dm/host/tests GAME=010015100B514000 sf dsp draw_texture
+      - name: Check shared memory with the physical iPhone SDK
+        run: |
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=26.0 \
+            -Werror=implicit-function-declaration -I dm/host -I dm/host/gen/010015100B514000 \
+            -fsyntax-only dm/host/hle_shmem.c
       - name: Set up .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
@@ -87,7 +97,7 @@ jobs:
           xcrun -sdk iphoneos metal -c -mios-version-min=18.0 "$RUNNER_TEMP/draw_texture.metal" -o "$RUNNER_TEMP/draw_texture-ios.air"
           make -C dm/host GAME=010015100B514000
       - name: Download and stage the game once
-        if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
+        if: ${{ !inputs.check_only && inputs.reuse_run == '' && inputs.assemble_run == '' }}
         env:
           GAME_FILES_JSON: ${{ secrets.GAME_FILES_JSON }}
           PROD_KEYS: ${{ secrets.PROD_KEYS }}
@@ -102,7 +112,7 @@ jobs:
           python scripts/build_ipa_from_nsp.py "${args[@]}"
           python dm/tools/ci_sharded_ipa.py prepare --game-dir "$NX_ROOT/game" --output "$NX_ROOT/prepared" --shards 8
       - name: Encrypt prepared game inputs
-        if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
+        if: ${{ !inputs.check_only && inputs.reuse_run == '' && inputs.assemble_run == '' }}
         env:
           IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
         run: |
@@ -114,7 +124,7 @@ jobs:
             (cd "$NX_ROOT/encrypted/$folder" && shasum -a 256 "$kind.tar.gz.gpg" > SHA256SUMS.txt)
           done
       - name: Save encrypted compile inputs
-        if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
+        if: ${{ !inputs.check_only && inputs.reuse_run == '' && inputs.assemble_run == '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nxnative-compile-inputs-${{ github.run_id }}
@@ -123,7 +133,7 @@ jobs:
           overwrite: true
           retention-days: 3
       - name: Save encrypted runtime assets
-        if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
+        if: ${{ !inputs.check_only && inputs.reuse_run == '' && inputs.assemble_run == '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nxnative-runtime-assets-${{ github.run_id }}
@@ -136,10 +146,13 @@ jobs:
         id: plan
         env:
           REUSE_RUN: ${{ inputs.reuse_run }}
+          ASSEMBLE_RUN: ${{ inputs.assemble_run }}
         run: |
           [[ -z "$REUSE_RUN" || "$REUSE_RUN" =~ ^[0-9]+$ ]]
+          [[ -z "$ASSEMBLE_RUN" || "$ASSEMBLE_RUN" =~ ^[0-9]+$ ]]
           echo 'matrix={"index":[0,1,2,3,4,5,6,7]}' >> "$GITHUB_OUTPUT"
-          echo "source_run=${REUSE_RUN:-$GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "source_run=${REUSE_RUN:-${ASSEMBLE_RUN:-$GITHUB_RUN_ID}}" >> "$GITHUB_OUTPUT"
+          echo "shader_run=${ASSEMBLE_RUN:-$GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
       - name: Encrypt preparation diagnostics
         if: ${{ always() && !inputs.check_only }}
         env:
@@ -167,7 +180,7 @@ jobs:
 
   shaders:
     needs: prepare
-    if: ${{ !inputs.check_only }}
+    if: ${{ !inputs.check_only && inputs.assemble_run == '' }}
     runs-on: macos-26
     timeout-minutes: 330
     strategy:
@@ -240,7 +253,7 @@ jobs:
 
   assemble:
     needs: [prepare, shaders]
-    if: ${{ !inputs.check_only }}
+    if: ${{ always() && !cancelled() && !inputs.check_only && needs.prepare.result == 'success' && (needs.shaders.result == 'success' || (inputs.assemble_run != '' && needs.shaders.result == 'skipped')) }}
     runs-on: macos-26
     timeout-minutes: 180
     steps:
@@ -260,9 +273,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN: ${{ needs.prepare.outputs.source_run }}
+          SHADER_RUN: ${{ needs.prepare.outputs.shader_run }}
         run: |
           gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" --name "nxnative-runtime-assets-$SOURCE_RUN" --dir "$NX_ROOT/download/assets"
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern "nxnative-shaders-*-$GITHUB_RUN_ID" --dir "$NX_ROOT/download/shards"
+          gh run download "$SHADER_RUN" --repo "$GITHUB_REPOSITORY" --pattern "nxnative-shaders-*-$SHADER_RUN" --dir "$NX_ROOT/download/shards"
           (cd "$NX_ROOT/download/assets" && shasum -a 256 -c SHA256SUMS.txt)
       - name: Decrypt and unpack inputs
         env:

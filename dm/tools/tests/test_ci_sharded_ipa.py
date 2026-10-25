@@ -1,9 +1,11 @@
 """Synthetic end-to-end shard coverage and staged-build boundaries, without game data."""
 from contextlib import ExitStack, redirect_stdout
+import errno
 import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -76,6 +78,25 @@ class MergeTests(unittest.TestCase):
                 self.assertEqual(manifest['primary'], plan['shards'][i]['primary'])
             self.assertEqual(ci.merge_shards(assets, shards, root / 'out'), plan)
             self.assertEqual(len(list((root / 'out/ios/b-abcd1234').glob('*_b.metallib'))), 3)
+
+    def test_merged_libraries_share_storage_and_survive_removing_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); assets, plan, shards = shader_fixture(root)
+            ci.merge_shards(assets, shards, root / 'out')
+            relative = f'ios/b-abcd1234/{plan["keys"][0]}_b.metallib'
+            source, target = shards[0] / relative, root / 'out' / relative
+            self.assertEqual(source.stat().st_ino, target.stat().st_ino)
+            for shard in shards: shutil.rmtree(shard)
+            self.assertEqual(target.read_bytes(), b'library')
+
+    def test_merge_copies_when_storage_cannot_be_shared(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); assets, plan, shards = shader_fixture(root)
+            with patch.object(ci.os, 'link', side_effect=OSError(errno.EXDEV, 'Different volume')):
+                ci.merge_shards(assets, shards, root / 'out')
+            for shard in shards: shutil.rmtree(shard)
+            for key in plan['keys']:
+                self.assertEqual((root / f'out/ios/b-abcd1234/{key}_b.metallib').read_bytes(), b'library')
 
     def test_missing_shard_bad_hash_and_stale_inputs_are_rejected(self):
         for failure in ('missing', 'checksum', 'inputs', 'compiler', 'coverage', 'incomplete', 'duplicate'):

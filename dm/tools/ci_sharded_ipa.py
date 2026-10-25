@@ -221,9 +221,14 @@ def merge_shards(assets, shards, output):
             if not source.is_file() or digest(source) != checksum: raise BuildError('Compiled shader checksum mismatch')
             if relative in collected and collected[relative] != checksum: raise BuildError('Paired shader outputs differ between shards')
             if relative not in collected:
-                target = output / path; target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(source, target)
+                target = output / path; target.parent.mkdir(parents=True, exist_ok=True)
+                # Compiled outputs are immutable. Sharing their storage avoids a
+                # second complete shader set on the temporary runner volume.
+                try: os.link(source, target)
+                except OSError: shutil.copy2(source, target)
                 collected[relative] = checksum
         found[i] = manifest
+        print(f'Verified and merged shard {i + 1}/{count}: {len(expected["primary"]):,} primary keys.', flush=True)
     if set(found) != set(range(count)) or set(ownership) != set(plan['keys']): raise BuildError('Missing shader shards or keys')
     # Re-check reflection dependencies even when an incomplete manifest hashes correctly.
     for key in plan['keys']:
@@ -262,8 +267,12 @@ def assemble(args):
     # settings.py needs the game's control data for its language menu.
     (out / 'ipa/data/v0').mkdir(parents=True)
     if (assets / 'control.nacp').exists(): shutil.copy2(assets / 'control.nacp', out / 'ipa/data/v0/control.nacp')
-    with (logs / 'build_ipa.log').open('w') as log:
-        subprocess.run(['bash', REPO / 'dm/ios/tools/build_ipa.sh', out / 'game.ipa'], env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    try:
+        with (logs / 'build_ipa.log').open('w') as log:
+            subprocess.run(['bash', REPO / 'dm/ios/tools/build_ipa.sh', out / 'game.ipa'], env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    finally:
+        xcode_log = out / 'ipa/build/ios/pkg/build.log'
+        if xcode_log.is_file(): shutil.copy2(xcode_log, logs / 'xcodebuild.log')
     if not (out / 'game.ipa').is_file(): raise BuildError('IPA was not produced')
     print('Unsigned IPA assembled. Device behavior remains untested.', flush=True)
 

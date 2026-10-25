@@ -4,8 +4,11 @@
 // views; returning success without mapping leaves the SDK reading inaccessible AS.
 #include "dm.h"
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <sys/mman.h>
+
+// iOS does not expose mach_vm.h. The public vm_* interface also carries full
+// addresses on our 64-bit hosts, as it does in loader.c's iOS module mappings.
+_Static_assert(sizeof(vm_address_t) == sizeof(uint64_t), "Shared mappings require 64-bit VM addresses");
 
 #define SHM_MAX 64
 #define SHM_MAP_MAX 128
@@ -86,10 +89,10 @@ int shared_memory_svc(int num, uint64_t *r) {
             }
             if ((perm != 1 && perm != 3) || slot < 0 || overlap) result = 0xd401;
             else {
-                mach_vm_address_t dst = addr; vm_prot_t cur = 0, max = 0;
-                kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-                    mach_task_self(), (mach_vm_address_t)g_shm[i].base, FALSE, &cur, &max, VM_INHERIT_SHARE);
-                if (kr == KERN_SUCCESS) kr = mach_vm_protect(mach_task_self(), dst, size, FALSE, perm == 1 ? VM_PROT_READ : VM_PROT_READ | VM_PROT_WRITE);
+                vm_address_t dst = addr; vm_prot_t cur = 0, max = 0;
+                kern_return_t kr = vm_remap(mach_task_self(), &dst, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                    mach_task_self(), (vm_address_t)g_shm[i].base, FALSE, &cur, &max, VM_INHERIT_SHARE);
+                if (kr == KERN_SUCCESS) kr = vm_protect(mach_task_self(), dst, size, FALSE, perm == 1 ? VM_PROT_READ : VM_PROT_READ | VM_PROT_WRITE);
                 if (kr != KERN_SUCCESS) { LOG("[RED] shared memory map %#x failed: Mach %d", handle, kr); result = 0xd401; }
                 else { g_shm_maps[slot].handle = handle; g_shm_maps[slot].addr = addr; g_shm_maps[slot].size = size; g_shm_maps[slot].perm = perm; }
             }
