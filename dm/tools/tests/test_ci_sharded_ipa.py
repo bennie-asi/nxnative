@@ -30,12 +30,25 @@ class ShardPlanTests(unittest.TestCase):
         for count in (0, 33):
             with self.assertRaises(ci.BuildError): ci.partition(['0'*16], '', count)
 
+    def test_compiler_fingerprints_must_match_preparation(self):
+        actual = {'spirv-cross': 'installed', 'metal_macosx': 'compiler-A'}
+        modules = {'dmsh_chain': SimpleNamespace(tools_now=lambda: actual),
+                   'own_compilers': SimpleNamespace(check_tools=lambda: [])}
+        with patch.dict(sys.modules, modules):
+            self.assertEqual(ci.toolchain_context(), actual)
+            self.assertEqual(ci.toolchain_context({'toolchain': actual}), actual)
+            with self.assertRaisesRegex(ci.BuildError, 'compilers differ'):
+                ci.toolchain_context({'toolchain': {**actual, 'metal_macosx': 'compiler-B'}})
+        modules['own_compilers'] = SimpleNamespace(check_tools=lambda: ['translator changed'])
+        with patch.dict(sys.modules, modules), self.assertRaisesRegex(ci.BuildError, 'Unsupported shader toolchain'):
+            ci.toolchain_context()
+
 
 def shader_fixture(root):
     keys = ['0'*16, '1'*16, '2'*16]; parts = ci.partition(keys, '', 2)
     assets = root / 'assets'; assets.mkdir()
-    plan = {'format': 1, 'title': '0100000000000000', 'package': 'v0', 'chain': 'abcd1234',
-            'inputs': 'fixture', 'keys': keys, 'shards': parts}
+    plan = {'format': 2, 'title': '0100000000000000', 'package': 'v0', 'chain': 'abcd1234',
+            'inputs': 'fixture', 'toolchain': {'compiler': 'fixture'}, 'keys': keys, 'shards': parts}
     (assets / 'plan.json').write_text(json.dumps(plan))
     shards = []
     for part in parts:
@@ -47,7 +60,7 @@ def shader_fixture(root):
                 for suffix, data in [('_b.json', json.dumps(record).encode()), ('_b.metallib', b'library'), *([('_b.metal', b'source')] if platform == 'mac' else [])]:
                     name = key + suffix; (folder / name).write_bytes(data)
                     files[f'{platform}/b-abcd1234/{name}'] = ci.digest(folder / name)
-        manifest = {**part, 'format': 1, 'chain': plan['chain'], 'inputs': plan['inputs'], 'files': files, 'complete': True}
+        manifest = {**part, 'format': 2, 'chain': plan['chain'], 'inputs': plan['inputs'], 'toolchain': plan['toolchain'], 'files': files, 'complete': True}
         (source / 'shard.json').write_text(json.dumps(manifest))
         results = [{'key': k, 'st': 'ok'} for k in part['keys']]
         (source / 'mac/b-abcd1234/_b_build.json').write_text(json.dumps(results))
@@ -65,13 +78,14 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(len(list((root / 'out/ios/b-abcd1234').glob('*_b.metallib'))), 3)
 
     def test_missing_shard_bad_hash_and_stale_inputs_are_rejected(self):
-        for failure in ('missing', 'checksum', 'inputs', 'coverage', 'incomplete', 'duplicate'):
+        for failure in ('missing', 'checksum', 'inputs', 'compiler', 'coverage', 'incomplete', 'duplicate'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary); assets, plan, shards = shader_fixture(root)
                 manifest = json.loads((shards[0] / 'shard.json').read_text())
                 if failure == 'missing': shards.pop()
                 elif failure == 'checksum': next((shards[0] / 'ios').rglob('*.metallib')).write_bytes(b'changed')
                 elif failure == 'inputs': manifest['inputs'] = 'changed'
+                elif failure == 'compiler': manifest['toolchain'] = {'compiler': 'different'}
                 elif failure == 'coverage': manifest['keys'].pop()
                 elif failure == 'incomplete': manifest['complete'] = False
                 elif failure == 'duplicate': shards.append(shards[0])

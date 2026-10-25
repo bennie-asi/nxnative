@@ -19,6 +19,14 @@ def check_tools():
                   '; '.join(f'{m[1]} {m[3]} (tested: {m[2]})' for m in map(OWN.fullmatch, own)), flush=True)
     return bad
 
-dmsh_chain.check_tools = check_tools   # dmsh_build.py imports the same module object and calls it through the module
-sys.argv = [os.path.join(HERE, 'dmsh_build.py'), *sys.argv[1:]]
-runpy.run_path(sys.argv[0], run_name='__main__')
+def main(args=None):
+    previous, argv = dmsh_chain.check_tools, sys.argv
+    try:
+        dmsh_chain.check_tools = check_tools   # dmsh_build.py imports the same module object
+        sys.argv = [os.path.join(HERE, 'dmsh_build.py'), *(argv[1:] if args is None else args)]
+        runpy.run_path(sys.argv[0], run_name='__main__')
+    finally:
+        dmsh_chain.check_tools, sys.argv = previous, argv
+
+
+if __name__ == '__main__': main()

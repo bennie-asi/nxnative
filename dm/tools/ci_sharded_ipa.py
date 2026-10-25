@@ -63,9 +63,21 @@ def digest(path):
 
 def load_plan(root):
     plan = json.loads((root / 'plan.json').read_text())
-    if (plan.get('format') != 1 or not re.fullmatch('[0-9A-F]{16}', plan.get('title', '')) or
-            not re.fullmatch('v[0-9]+', plan.get('package', ''))): raise BuildError('Invalid prepared build plan')
+    if (plan.get('format') != 2 or not re.fullmatch('[0-9A-F]{16}', plan.get('title', '')) or
+            not re.fullmatch('v[0-9]+', plan.get('package', '')) or not isinstance(plan.get('toolchain'), dict) or
+            not plan['toolchain']): raise BuildError('Invalid prepared build plan; prepare new inputs with compiler fingerprints')
     return plan
+
+
+def toolchain_context(plan=None):
+    sys.path.insert(0, str(REPO / 'dm/gfx/tools'))
+    import dmsh_chain, own_compilers
+    errors = own_compilers.check_tools()
+    if errors: raise BuildError('Unsupported shader toolchain: ' + '; '.join(errors))
+    actual = dmsh_chain.tools_now()
+    if plan is not None and actual != plan['toolchain']:
+        raise BuildError('Shard compilers differ from preparation; use the same compiler versions for every shard')
+    return actual
 
 
 def chain_context(root, plan, check_tools=False):
@@ -74,8 +86,7 @@ def chain_context(root, plan, check_tools=False):
     sys.path[:0] = [str(REPO / 'dm/gfx/tools'), str(REPO / 'dm/games')]
     import dmsh_chain, game
     g = game.Game(profile)
-    errors = dmsh_chain.check_tools() if check_tools else []
-    if errors: raise BuildError('Shader toolchain differs from its lock file: ' + '; '.join(errors))
+    if check_tools: toolchain_context(plan)
     if dmsh_chain.version() != plan['chain'] or dmsh_chain.inputs(g) != plan['inputs']:
         raise BuildError('Prepared shader chain/profile changed; prepare a new build')
     if read_keys(profile) != plan['keys']: raise BuildError('Prepared shader-map coverage changed')
@@ -103,7 +114,7 @@ def prepare(args):
     g = game.Game(copied)
     keys = read_keys(copied); shards = partition(keys, (copied / 'shader_pairs.tsv').read_text(), args.shards)
     plan = {**{k: stage[k] for k in ('title', 'package', 'chain', 'app_name', 'app_version', 'bundle_id', 'language', 'show_fps', 'provisional')},
-            'format': 1, 'inputs': dmsh_chain.inputs(g), 'keys': keys, 'shards': shards, 'module_files': {}}
+            'format': 2, 'toolchain': toolchain_context(), 'inputs': dmsh_chain.inputs(g), 'keys': keys, 'shards': shards, 'module_files': {}}
     modules = Path(stage['patched'])
     if (modules / 'nro.tsv').exists(): raise BuildError('This sharded workflow does not yet support embedded NRO modules')
     module_files = [p for p in sorted(modules.iterdir()) if p.is_file() and (p.name.endswith('.patched.bin') or p.suffix == '.tsv')]
@@ -154,7 +165,7 @@ def validate_shard(root, plan, index):
                 path = directory / name
                 if not path.is_file() or not path.stat().st_size: raise BuildError(f'Missing compiled output {name}')
                 paths[f'{platform}/b-{chain}/{name}'] = digest(path)
-    return {'format': 1, 'index': index, 'chain': chain, 'inputs': plan['inputs'],
+    return {'format': 2, 'index': index, 'chain': chain, 'inputs': plan['inputs'], 'toolchain': plan['toolchain'],
             'keys': shard['keys'], 'primary': shard['primary'], 'files': paths, 'complete': True}
 
 
@@ -177,6 +188,7 @@ def compile_shard(args):
             count = sum(1 for _ in (out / 'ios' / ('b-' + plan['chain'])).glob('*_b.json'))
             print(f'Shard {args.index}: {count:,}/{len(keys):,} reflected shaders; elapsed {int(time.monotonic()-started)} s.', flush=True)
     if process.returncode: raise BuildError(f'Shard {args.index}: translator process failed; see encrypted compile.log')
+    toolchain_context(plan)   # compilers must not change during the build either
     manifest = validate_shard(out, plan, args.index)
     (out / 'shard.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(f'Shard {args.index}: verified {len(keys):,} shaders for macOS and iOS.', flush=True)
@@ -184,7 +196,7 @@ def compile_shard(args):
 
 def invoke(args):
     plan = load_plan(args.root); chain_context(args.root, plan)
-    script = REPO / 'dm/gfx/tools/dmsh_build.py'
+    script = REPO / 'dm/gfx/tools/own_compilers.py'
     sys.argv = [str(script), str(args.root / 'pkg'), str(args.output / 'mac'), *plan['shards'][args.index]['keys']]
     runpy.run_path(str(script), run_name='__main__')
 
@@ -194,7 +206,7 @@ def merge_shards(assets, shards, output):
     for root in shards:
         manifest = json.loads((root / 'shard.json').read_text()); i = manifest.get('index')
         if i in found or not isinstance(i, int) or not 0 <= i < count: raise BuildError('Invalid or repeated shard')
-        if not manifest.get('complete') or any(manifest.get(k) != plan[k] for k in ('chain', 'inputs')):
+        if manifest.get('format') != 2 or not manifest.get('complete') or any(manifest.get(k) != plan[k] for k in ('chain', 'inputs', 'toolchain')):
             raise BuildError('Incomplete shard or mismatched shader chain/profile')
         expected = plan['shards'][i]
         if manifest.get('keys') != expected['keys'] or manifest.get('primary') != expected['primary']:

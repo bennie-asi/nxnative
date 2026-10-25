@@ -49,6 +49,7 @@ jobs:
           python -m pip install lz4 capstone
           python -m unittest discover -s dm/tools/tests -p 'test_ci_sharded_ipa.py'
           python -m unittest discover -s dm/tools/tests -p 'test_loader_census.py'
+          python -m unittest discover -s dm/tools/tests -p 'test_own_compilers.py'
           python -m unittest discover -s dm/tools/tests -p 'test_nsp_*.py'
           make -C dm/host/tests GAME=010015100B514000 sf dsp
       - name: Set up .NET
@@ -61,16 +62,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/nxnative-sharded" "$RUNNER_TEMP/nxnative-sharded-gpg"
           chmod 700 "$RUNNER_TEMP/nxnative-sharded-gpg"
           bash dm/tools/ci_mac_dependencies.sh prepare
-      - name: Verify the locked shader toolchain before downloading game data
+      - name: Verify the translator and available compilers before downloading game data
         run: |
           python - <<'PY'
           import sys
           sys.path.insert(0, 'dm/gfx/tools')
-          import dmsh_chain
-          errors = dmsh_chain.check_tools()
+          import own_compilers
+          errors = own_compilers.check_tools()
           if errors:
               raise SystemExit('\n'.join('[RED] ' + error for error in errors))
-          print('Verified the locked translator, SPIRV-Cross and macOS/iOS Metal compilers.')
+          print('Verified the locked translator and available SPIRV-Cross/macOS/iOS Metal compilers.')
           PY
       - name: Download and stage the game once
         if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
