@@ -87,6 +87,16 @@ Get-FileHash -Algorithm SHA256 -LiteralPath .\game.ipa.gpg
 
 Sign and install `game.ipa` using your Windows sideloading tool, such as [Sideloadly](https://sideloadly.io/). The IPA is unsigned; downloading it alone does not install it. Where supported by your signing setup, preserve the **Increased Memory Limit** entitlement for larger games (see the [README](../README.md#pack-an-ipa)). The workflow does not test the game on an iPhone.
 
+## Large shader sets: compile in separate jobs
+
+**Build IPA in shader shards** uses standard `macos-26` runners to split the NVN shader set into eight jobs, then verifies and assembles all outputs into one unsigned IPA. This is useful when the full shader build exceeds the six-hour limit of a single hosted job. It uses the same `GAME_FILES_JSON`, `PROD_KEYS` and `IPA_PASSWORD` secrets as the normal workflow. It does not require a local Mac.
+
+The preparation job downloads and extracts the game once, rewrites its code, and saves separate encrypted compile inputs and runtime assets. Each shader job downloads only the compile inputs. Vertex shaders retain their paired pixel dependencies. A shard succeeds only when every assigned shader compiles for macOS and iOS and its output files pass validation. The assembly job checks complete key coverage, file hashes, profile inputs and the shader-chain version, then generates the normal guard tables and builds the unsigned app. It does not run the game or test an iPhone.
+
+Prepared inputs and compiled shards are encrypted with `IPA_PASSWORD` and expire after three days. To repeat compilation after a failed shader or assembly job, set `reuse_run` to the original sharded run ID; this reuses its prepared inputs without a new game URL or download from Windows. Keep the same password. A changed shader chain or profile inputs requires a fresh preparation. Rerunning only failed jobs within the same run preserves successful shard artifacts. The final `nxnative-ipa-<run ID>-<attempt>` artifact downloads and decrypts as described above. `check_only` verifies the sharding and staging logic plus service/audio checks without using game files or secrets.
+
+This workflow currently stages NVN titles without embedded NRO modules. Titles that require a runtime shader capture or decompression still need a Mac with the runtime graphics capabilities that capture uses; the offline compiler alone cannot provide those capabilities.
+
 ## Faster iterations on the iOS host
 
 After a successful full NVN build, **Rebuild iPhone host** can reuse that run's encrypted IPA and diagnostics. It recompiles the host and repacks the existing game data and iOS shader libraries, avoiding another game upload or shader compilation. The source artifacts must still exist, and `IPA_PASSWORD` must be the password used for them.

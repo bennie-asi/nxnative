@@ -1532,6 +1532,7 @@ def parse_args(argv):
     ap.add_argument('--show-fps', action=argparse.BooleanOptionalAction, help='show the game\'s frame rate on the iPhone, frames on screen per second at the top left (default: the SHOW_FPS setting, on)')
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
     ap.add_argument('--mac-probe', action='store_true', help='extract, rewrite and probe native startup for 60 seconds on an ARM64 Mac; no shader compilation or IPA, diagnostics in the build logs')
+    ap.add_argument('--stage-only', action='store_true', help='prepare extraction, rewritten modules and NVN shader packages for distributed CI; write ci_stage.json without compiling shaders or an IPA')
     ap.add_argument('--allow-damaged', action='store_true', help='a damaged NSP (files failing the NCA hash check): write them as read and go on instead of stopping')
     ap.add_argument('--profile-out', help='where the provisional profile goes (default: <NSP folder>/<title ID>_build/profile)')
     ap.add_argument('--provisional', action='store_true', help='build from a provisional profile even when dm/games has one for the game (tests the guesses)')
@@ -1563,6 +1564,8 @@ def main(args=None):
     here = Path(globals().get('__file__') or sys.argv[0]).resolve()
     repo = find_repo(here)
     prepare_xcode = args.prepare_xcode or PREPARE_XCODE
+    if args.stage_only and (prepare_xcode or args.mac_probe or args.platform == 'mac'):
+        raise BuildError('--stage-only cannot be combined with Xcode preparation or Mac execution')
     platform = args.platform or PLATFORM
     if platform not in ('ios', 'mac'): raise BuildError(f'PLATFORM / --platform must be ios or mac: {platform}')
     mac = platform == 'mac' or args.mac_probe   # a Mac-only build or bounded startup probe: no IPA
@@ -1681,6 +1684,7 @@ def main(args=None):
     # how the shaders are got follows from the packed version's files (profile_guess.py shader_sources): the graphics API, and the shaders made only at run time
     src = pg.build_sources(game / 'ExeFS', game / 'RomFS', g.words('modules'))
     gfx = src['graphics'][0]   # nvn, vulkan (Hades: the host's Vulkan layer, SPIR-V shaders) or gl (Digimon Story Cyber Sleuth: the host's GL layer, GLSL sources)
+    if args.stage_only and gfx != 'nvn': raise BuildError('--stage-only currently supports NVN games only')
     glslc = gfx == 'nvn' and src['glslc_capture'][0]   # shaders the game compiles at run time, captured in the Mac host (capture_glslc)
     vkcap = gfx == 'vulkan' and src['vk_capture'][0]   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_shaders)
     glcap = gfx == 'gl' and src['gl_capture'][0]   # GLSL the game puts together at run time (LÖVE), captured in the Mac host (capture_shaders)
@@ -1735,6 +1739,15 @@ def main(args=None):
         oodle = (lambda: {'DM_OODLE_HOST': str(build_mac_host(repo, work / 'tools/dmhost', env, logs, g)), 'DM_OODLE_MODULES': str(patched)}) if src['oodle_packs'][0] or src['ue_legacy'][0] else None
         own = bool(provisional or derived)   # the shader tables come from this build's split (the profile's are checked otherwise)
         pkey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own, oodle)
+        if args.stage_only:
+            stage = {'format': 1, 'title': g.id, 'package': pkg_ver, 'profile': str(g.dir),
+                     'patched': str(patched), 'extraction': str(game), 'shader_packages': str(sh / 'pkg'),
+                     'aoc': str(aoc) if aoc else None, 'chain': chain_of(repo), 'provisional': bool(provisional),
+                     'app_name': app_name, 'app_version': app_version or '1.0', 'bundle_id': bundle_id,
+                     'language': lang, 'show_fps': SHOW_FPS if args.show_fps is None else args.show_fps}
+            (work / 'ci_stage.json').write_text(json.dumps(stage, indent=2) + '\n')
+            say(f'staged build inputs: {work / "ci_stage.json"}; shaders and IPA have not been compiled')
+            return
         ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac)
     if mac:   # a Mac-only build ends with the Mac host and the command that runs the game
         cmd = mac_run(py, repo, work, game, patched, ios, aoc, gfx, lang, env, logs, g, args.env_file or DM_ENV_FILE)

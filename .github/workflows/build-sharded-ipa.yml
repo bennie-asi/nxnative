@@ -1,0 +1,304 @@
+name: Build IPA in shader shards
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Game update version (empty selects the newest)
+        type: string
+        default: ""
+      language:
+        description: Game language
+        type: string
+        default: en-US
+      reuse_run:
+        description: Optional previous sharded run whose encrypted prepared inputs still exist
+        type: string
+        default: ""
+      check_only:
+        description: Run data-free checks without preparing or compiling a game
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  PYTHONUNBUFFERED: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+jobs:
+  prepare:
+    runs-on: macos-26
+    timeout-minutes: 150
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      source_run: ${{ steps.plan.outputs.source_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Check sharding, staging and runtime services
+        run: |
+          python -m pip install lz4 capstone
+          python -m unittest discover -s dm/tools/tests -p 'test_ci_sharded_ipa.py'
+          python -m unittest discover -s dm/tools/tests -p 'test_nsp_*.py'
+          make -C dm/host/tests GAME=010015100B514000 sf dsp
+      - name: Set up .NET
+        if: ${{ !inputs.check_only }}
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x"
+      - name: Prepare temporary paths and tools
+        if: ${{ !inputs.check_only }}
+        run: |
+          printf 'NX_ROOT=%s\nGNUPGHOME=%s\n' "$RUNNER_TEMP/nxnative-sharded" "$RUNNER_TEMP/nxnative-sharded-gpg" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/nxnative-sharded" "$RUNNER_TEMP/nxnative-sharded-gpg"
+          chmod 700 "$RUNNER_TEMP/nxnative-sharded-gpg"
+          bash dm/tools/ci_mac_dependencies.sh prepare
+      - name: Download and stage the game once
+        if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
+        env:
+          GAME_FILES_JSON: ${{ secrets.GAME_FILES_JSON }}
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+          GAME_PACKAGE: ${{ inputs.package }}
+          GAME_LANGUAGE: ${{ inputs.language }}
+        run: |
+          python dm/tools/ci_ipa_inputs.py download --game-dir "$NX_ROOT/game"
+          args=("$NX_ROOT/game" -k "$NX_ROOT/game/prod.keys" --stage-only --progress lines)
+          [[ -z "$GAME_PACKAGE" ]] || args+=(--package "$GAME_PACKAGE")
+          [[ -z "$GAME_LANGUAGE" ]] || args+=(--language "$GAME_LANGUAGE")
+          python scripts/build_ipa_from_nsp.py "${args[@]}"
+          python dm/tools/ci_sharded_ipa.py prepare --game-dir "$NX_ROOT/game" --output "$NX_ROOT/prepared" --shards 8
+      - name: Encrypt prepared game inputs
+        if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          mkdir -p "$NX_ROOT/encrypted/compile" "$NX_ROOT/encrypted/assets"
+          for kind in compile-inputs runtime-assets; do
+            if [[ "$kind" == compile-inputs ]]; then folder=compile; else folder=assets; fi
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+              --output "$NX_ROOT/encrypted/$folder/$kind.tar.gz.gpg" "$NX_ROOT/prepared/$kind.tar.gz" <<< "$IPA_PASSWORD"
+            (cd "$NX_ROOT/encrypted/$folder" && shasum -a 256 "$kind.tar.gz.gpg" > SHA256SUMS.txt)
+          done
+      - name: Save encrypted compile inputs
+        if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-compile-inputs-${{ github.run_id }}
+          path: ${{ env.NX_ROOT }}/encrypted/compile/*
+          compression-level: 0
+          overwrite: true
+          retention-days: 3
+      - name: Save encrypted runtime assets
+        if: ${{ !inputs.check_only && inputs.reuse_run == '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-runtime-assets-${{ github.run_id }}
+          path: ${{ env.NX_ROOT }}/encrypted/assets/*
+          compression-level: 0
+          overwrite: true
+          retention-days: 3
+      - name: Select the shader matrix and prepared source run
+        if: ${{ !inputs.check_only }}
+        id: plan
+        env:
+          REUSE_RUN: ${{ inputs.reuse_run }}
+        run: |
+          [[ -z "$REUSE_RUN" || "$REUSE_RUN" =~ ^[0-9]+$ ]]
+          echo 'matrix={"index":[0,1,2,3,4,5,6,7]}' >> "$GITHUB_OUTPUT"
+          echo "source_run=${REUSE_RUN:-$GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+      - name: Encrypt preparation diagnostics
+        if: ${{ always() && !inputs.check_only }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          [[ -n "${NX_ROOT:-}" && -d "$NX_ROOT/game" && -n "$IPA_PASSWORD" ]] || exit 0
+          mkdir -p "$NX_ROOT/diagnostics"
+          python dm/tools/ci_ipa_inputs.py diagnostics --game-dir "$NX_ROOT/game" --output "$NX_ROOT/diagnostics.tar.gz"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_ROOT/diagnostics/diagnostics.tar.gz.gpg" "$NX_ROOT/diagnostics.tar.gz" <<< "$IPA_PASSWORD"
+      - name: Save preparation diagnostics
+        if: ${{ always() && !inputs.check_only }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-prepare-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NX_ROOT }}/diagnostics/diagnostics.tar.gz.gpg
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: ignore
+      - name: Remove keys
+        if: ${{ always() && !inputs.check_only }}
+        run: |
+          [[ -n "${NX_ROOT:-}" ]] || exit 0
+          rm -f -- "$NX_ROOT/game/prod.keys"
+
+  shaders:
+    needs: prepare
+    if: ${{ !inputs.check_only }}
+    runs-on: macos-26
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x"
+      - name: Set up the offline Metal compiler
+        run: |
+          printf 'NX_ROOT=%s\nGNUPGHOME=%s\n' "$RUNNER_TEMP/nxnative-shard" "$RUNNER_TEMP/nxnative-shard-gpg" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/nxnative-shard" "$RUNNER_TEMP/nxnative-shard-gpg"
+          chmod 700 "$RUNNER_TEMP/nxnative-shard-gpg"
+          bash dm/tools/ci_mac_dependencies.sh compile
+      - name: Download and decrypt only shader inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ needs.prepare.outputs.source_run }}
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" --name "nxnative-compile-inputs-$SOURCE_RUN" --dir "$NX_ROOT/download"
+          (cd "$NX_ROOT/download" && shasum -a 256 -c SHA256SUMS.txt)
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
+            --output "$NX_ROOT/inputs.tar.gz" "$NX_ROOT/download/compile-inputs.tar.gz.gpg" <<< "$IPA_PASSWORD"
+          python - <<'PY'
+          import os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['NX_ROOT'])
+          with tarfile.open(root / 'inputs.tar.gz') as archive: archive.extractall(root / 'inputs', filter='data')
+          PY
+      - name: Compile and verify this shard
+        env:
+          SHARD_INDEX: ${{ matrix.index }}
+        run: python dm/tools/ci_sharded_ipa.py compile --root "$NX_ROOT/inputs" --index "$SHARD_INDEX" --output "$NX_ROOT/result" --workers 3
+      - name: Encrypt compiled shaders and diagnostics
+        if: ${{ always() }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          [[ -n "${NX_ROOT:-}" && -d "$NX_ROOT/result" && -n "$IPA_PASSWORD" ]] || exit 0
+          python - <<'PY'
+          import os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['NX_ROOT'])
+          with tarfile.open(root / 'shard.tar.gz', 'w:gz', compresslevel=1) as archive:
+              for name in ('mac', 'ios', 'shard.json', 'compile.log'):
+                  path = root / 'result' / name
+                  if path.exists(): archive.add(path, arcname=name)
+          PY
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_ROOT/shard.tar.gz.gpg" "$NX_ROOT/shard.tar.gz" <<< "$IPA_PASSWORD"
+      - name: Save the encrypted shard
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-shaders-${{ matrix.index }}-${{ github.run_id }}
+          path: ${{ env.NX_ROOT }}/shard.tar.gz.gpg
+          compression-level: 0
+          overwrite: true
+          retention-days: 3
+          if-no-files-found: ignore
+
+  assemble:
+    needs: [prepare, shaders]
+    if: ${{ !inputs.check_only }}
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Set up the unsigned iOS builder
+        run: |
+          printf 'NX_ROOT=%s\nGNUPGHOME=%s\n' "$RUNNER_TEMP/nxnative-assemble" "$RUNNER_TEMP/nxnative-assemble-gpg" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/nxnative-assemble" "$RUNNER_TEMP/nxnative-assemble-gpg"
+          chmod 700 "$RUNNER_TEMP/nxnative-assemble-gpg"
+          bash dm/tools/ci_mac_dependencies.sh assemble
+      - name: Download encrypted runtime assets and shaders
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ needs.prepare.outputs.source_run }}
+        run: |
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" --name "nxnative-runtime-assets-$SOURCE_RUN" --dir "$NX_ROOT/download/assets"
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern "nxnative-shaders-*-$GITHUB_RUN_ID" --dir "$NX_ROOT/download/shards"
+          (cd "$NX_ROOT/download/assets" && shasum -a 256 -c SHA256SUMS.txt)
+      - name: Decrypt and unpack inputs
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
+            --output "$NX_ROOT/assets.tar.gz" "$NX_ROOT/download/assets/runtime-assets.tar.gz.gpg" <<< "$IPA_PASSWORD"
+          for directory in "$NX_ROOT"/download/shards/*; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt \
+              --output "$directory/shard.tar.gz" "$directory/shard.tar.gz.gpg" <<< "$IPA_PASSWORD"
+          done
+          python - <<'PY'
+          import os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['NX_ROOT'])
+          with tarfile.open(root / 'assets.tar.gz') as archive: archive.extractall(root / 'assets', filter='data')
+          for path in (root / 'download/shards').glob('*/shard.tar.gz'):
+              with tarfile.open(path) as archive: archive.extractall(root / 'shards' / path.parent.name, filter='data')
+          PY
+      - name: Verify full coverage and build the unsigned IPA
+        run: python dm/tools/ci_sharded_ipa.py assemble --root "$NX_ROOT/assets" --shards "$NX_ROOT/shards" --output "$NX_ROOT/build"
+      - name: Encrypt the unsigned IPA
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          mkdir -p "$NX_ROOT/output"
+          python dm/tools/ci_ipa_inputs.py check-encryption-space --game-dir "$NX_ROOT/build"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_ROOT/output/game.ipa.gpg" "$NX_ROOT/build/game.ipa" <<< "$IPA_PASSWORD"
+          (cd "$NX_ROOT/output" && shasum -a 256 game.ipa.gpg > SHA256SUMS.txt)
+      - name: Upload encrypted IPA
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-ipa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NX_ROOT }}/output/*
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - name: Encrypt assembly diagnostics
+        if: ${{ always() }}
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          [[ -n "${NX_ROOT:-}" && -d "$NX_ROOT/build" && -n "$IPA_PASSWORD" ]] || exit 0
+          python - <<'PY'
+          import os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['NX_ROOT']); assets = root / 'assets'; title = __import__('json').loads((assets / 'plan.json').read_text())['title']
+          with tarfile.open(root / 'diagnostics.tar.gz', 'w:gz') as archive:
+              if (root / 'build/logs').exists(): archive.add(root / 'build/logs', arcname=f'{title}_build/logs')
+              archive.add(assets / 'profile' / title / 'game.tsv', arcname=f'{title}_build/profile/{title}/game.tsv')
+          PY
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$NX_ROOT/diagnostics.tar.gz.gpg" "$NX_ROOT/diagnostics.tar.gz" <<< "$IPA_PASSWORD"
+      - name: Upload encrypted assembly diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NX_ROOT }}/diagnostics.tar.gz.gpg
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: ignore
